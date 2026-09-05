@@ -204,7 +204,6 @@ void setup() {
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);  // 关闭省电模式,降低音频延迟抖动
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    WiFi.autoReconnect(true);
 
     ws.begin(SERVER_HOST, SERVER_PORT, SERVER_PATH);
     ws.onEvent(onWsEvent);
@@ -216,7 +215,8 @@ void loop() {
     ws.loop();
     ledUpdate();
 
-    // WiFi 看门狗
+    // WiFi 看门狗:断开后每 5 秒重连一次
+    static uint32_t lastWifiTry = 0;
     if (WiFi.status() == WL_CONNECTED) {
         if (!wifiOk) {
             wifiOk = true;
@@ -225,6 +225,10 @@ void loop() {
         }
     } else {
         wifiOk = false;
+        if (millis() - lastWifiTry > 5000) {
+            lastWifiTry = millis();
+            WiFi.reconnect();
+        }
     }
 
     // WebSocket 看门狗:断开后每 5 秒重连一次
