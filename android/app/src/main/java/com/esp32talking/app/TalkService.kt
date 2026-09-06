@@ -53,6 +53,9 @@ class TalkService : Service() {
         private const val FRAME_SAMPLES = 320          // 20ms
         private const val FRAME_BYTES = FRAME_SAMPLES * 2
         private const val MAX_QUEUE_FRAMES = 150       // 约 3 秒播放缓冲
+        // 软件播放增益档位(不同 ROM 外放差异大,靠放大 PCM 兜底)
+        private val GAIN_STEPS = floatArrayOf(1f, 2f, 3f, 4f)
+        private const val KEY_GAIN = "gain_idx"
         const val ACTION_CONNECT = "com.esp32talking.app.CONNECT"
         const val EXTRA_URL = "url"
     }
@@ -101,6 +104,7 @@ class TalkService : Service() {
     private var playerThread: Thread? = null
     private val playQueue = ArrayDeque<ByteArray>()
     private val playLock = Object()
+    private var gainIdx = 0
 
     // ---- 保活锁 ----
     private var wakeLock: PowerManager.WakeLock? = null
@@ -112,6 +116,8 @@ class TalkService : Service() {
         super.onCreate()
         val chan = NotificationChannel(CHANNEL_ID, "对讲机连接", NotificationManager.IMPORTANCE_LOW)
         getSystemService(NotificationManager::class.java).createNotificationChannel(chan)
+        gainIdx = getSharedPreferences(PREFS, MODE_PRIVATE).getInt(KEY_GAIN, 0)
+            .coerceIn(0, GAIN_STEPS.size - 1)
         startPlayer()
     }
 
@@ -419,16 +425,46 @@ class TalkService : Service() {
 
     // ---------------- 播放 ----------------
 
+    /** 切换软件增益档位(1x→2x→3x→4x→1x),返回新档位下标 */
+    fun cycleGain(): Int {
+        gainIdx = (gainIdx + 1) % GAIN_STEPS.size
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt(KEY_GAIN, gainIdx).apply()
+        return gainIdx
+    }
+
+    fun gainIndex(): Int = gainIdx
+
+    fun gainLabel(): String = "音量x${GAIN_STEPS[gainIdx].toInt()}"
+
+    /** 就地放大 PCM16 数据,带削波保护 */
+    private fun applyGain(chunk: ByteArray) {
+        val g = GAIN_STEPS[gainIdx]
+        if (g <= 1f) return
+        var i = 0
+        while (i < chunk.size) {
+            val lo = chunk[i].toInt() and 0xFF
+            val hi = chunk[i + 1].toInt()
+            var sample = ((hi shl 8) or lo) * g
+            if (sample > 32767f) sample = 32767f
+            if (sample < -32768f) sample = -32768f
+            val s = sample.toInt()
+            chunk[i] = (s and 0xFF).toByte()
+            chunk[i + 1] = ((s shr 8) and 0xFF).toByte()
+            i += 2
+        }
+    }
+
     private fun startPlayer() {
         val minBuf = AudioTrack.getMinBufferSize(
             SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
         )
-        // USAGE_MEDIA 保证走扬声器外放(VOICE_COMMUNICATION 可能路由到听筒导致音量小)
+        // USAGE_MEDIA + CONTENT_TYPE_MUSIC:确保走"媒体音量"通道。
+        // 部分 ROM(如 Flyme)对 SPEECH 内容类型走独立音量/路由,导致外放偏小。
         val t = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                     .build()
             )
             .setAudioFormat(
@@ -452,6 +488,7 @@ class TalkService : Service() {
                 if (chunk == null) {
                     Thread.sleep(10)
                 } else {
+                    applyGain(chunk)
                     t.write(chunk, 0, chunk.size)
                 }
             }

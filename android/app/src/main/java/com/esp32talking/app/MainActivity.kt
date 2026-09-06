@@ -55,6 +55,7 @@ class MainActivity : Activity() {
     private lateinit var tvStatus: TextView
     private lateinit var tvMyName: TextView
     private lateinit var btnMyName: Button
+    private lateinit var btnGain: Button
     private lateinit var etServer: EditText
     private lateinit var btnConnect: Button
     private lateinit var btnPtt: Button
@@ -109,6 +110,7 @@ class MainActivity : Activity() {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
             val s = (binder as TalkService.LocalBinder).service()
             svc = s
+            btnGain.text = s.gainLabel()
             s.addListener(listener)
         }
 
@@ -123,6 +125,7 @@ class MainActivity : Activity() {
         tvStatus = findViewById(R.id.tvStatus)
         tvMyName = findViewById(R.id.tvMyName)
         btnMyName = findViewById(R.id.btnMyName)
+        btnGain = findViewById(R.id.btnGain)
         etServer = findViewById(R.id.etServer)
         btnConnect = findViewById(R.id.btnConnect)
         btnPtt = findViewById(R.id.btnPtt)
@@ -175,6 +178,11 @@ class MainActivity : Activity() {
         }
         btnMyName.setOnClickListener {
             showNicknameDialog()
+        }
+        btnGain.setOnClickListener {
+            val idx = svc?.cycleGain() ?: return@setOnClickListener
+            btnGain.text = "音量x${idx + 1}"
+            toast(if (idx == 0) "已恢复原始音量" else "播放音量增强 x${idx + 1}(在服务里对 PCM 放大)")
         }
 
         btnPtt.setOnTouchListener { _, e ->
