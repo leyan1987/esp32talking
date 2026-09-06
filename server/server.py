@@ -9,11 +9,17 @@
 - Web 管理台:浏览器打开 http://<服务器IP>:8000/
 
 协议(WebSocket 文本帧为 JSON,二进制帧为 640 字节 PCM):
-  C->S  {"type":"hello","id":"..","kind":".."}   首条消息,id=MAC或UUID
+  C->S  {"type":"hello","id":"..","kind":"..","join_code":"123456"?}
+                                                 首条消息,id=MAC或UUID;
+                                                 join_code 可选,自动加入该群号
   C->S  {"type":"select_group","group_id":N}     切换当前群组(监听/通讯目标)
+  C->S  {"type":"create_group","name":".."}      新建群组(创建者自动加入并切换)
+  C->S  {"type":"join_group","code":"123456"}    凭 6 位群号加入群组
   C->S  {"type":"list_groups"}                   请求刷新自己的群组列表
   S->C  {"type":"welcome","device":{...},"groups":[..],"active_group_id":N}
   S->C  {"type":"groups","groups":[..],"active_group_id":N}  群组变更推送
+  S->C  {"type":"created","group_id":N,"name":".."}
+  S->C  {"type":"error","message":".."}
   S->C  {"type":"rejected","reason":".."}        随后断开(设备被禁用)
   S->C  {"type":"ack","echo":".."}               M1 兼容应答
 
@@ -26,6 +32,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -57,7 +64,7 @@ db.executescript(
         last_seen TEXT
     );
     CREATE TABLE IF NOT EXISTS groups(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id INTEGER PRIMARY KEY,       -- 群号:6 位数字(100000~999999),客户端凭此加入
         name TEXT NOT NULL,
         created_at TEXT DEFAULT (datetime('now','localtime'))
     );
@@ -75,6 +82,21 @@ def now() -> str:
     import datetime
 
     return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def allocate_group_id() -> int:
+    """分配一个未占用的 6 位群号。"""
+    while True:
+        gid = random.randint(100000, 999999)
+        if not db.execute("SELECT 1 FROM groups WHERE id = ?", (gid,)).fetchone():
+            return gid
+
+
+def find_group_by_code(code: str):
+    """按群号字符串查找群组,兼容前导零。"""
+    if not code.isdigit():
+        return None
+    return db.execute("SELECT * FROM groups WHERE id = ?", (int(code),)).fetchone()
 
 
 # ---------------- 在线连接 ----------------
@@ -182,6 +204,20 @@ async def ws_endpoint(ws: WebSocket) -> None:
             await ws.close(code=1008)
             return
 
+        # ---- hello 携带 join_code 时自动加入该群组(ESP32 免输入加入方式) ----
+        join_code = str(hello.get("join_code") or "").strip()
+        if join_code:
+            g = find_group_by_code(join_code)
+            if g is not None:
+                db.execute(
+                    "INSERT OR IGNORE INTO group_members(group_id, device_id) VALUES(?, ?)",
+                    (g["id"], device_id),
+                )
+                db.commit()
+                log.info("设备 %s 凭群号 %s 加入群组", device_id, join_code)
+            else:
+                log.warning("设备 %s 的 join_code %s 无效,忽略", device_id, join_code)
+
         # ---- 同设备重复连接:踢掉旧连接 ----
         old = conn_by_device.get(device_id)
         if old and old in conns:
@@ -250,6 +286,51 @@ async def handle_text(conn: Conn, text: str) -> None:
             db.commit()
             await push_groups(conn)
             log.info("设备 %s 切换群组 -> %d", conn.device_id, gid)
+
+    elif t == "create_group":
+        # 安卓端"新建群组":创建后创建者自动加入并切换为当前群组
+        name = str(obj.get("name", "")).strip()
+        if not name:
+            await ws_send_json(conn, {"type": "error", "message": "群组名不能为空"})
+            return
+        gid = allocate_group_id()
+        db.execute("INSERT INTO groups(id, name) VALUES(?, ?)", (gid, name))
+        db.execute(
+            "INSERT INTO group_members(group_id, device_id) VALUES(?, ?)",
+            (gid, conn.device_id),
+        )
+        conn.member_groups.add(gid)
+        conn.active_group_id = gid
+        db.execute(
+            "UPDATE devices SET active_group_id = ? WHERE id = ?", (gid, conn.device_id)
+        )
+        db.commit()
+        await ws_send_json(conn, {"type": "created", "group_id": gid, "name": name})
+        await push_groups(conn)
+        log.info("设备 %s 创建群组 %d (%s)", conn.device_id, gid, name)
+
+    elif t == "join_group":
+        # 凭 6 位群号加入群组
+        code = str(obj.get("code", "")).strip()
+        g = find_group_by_code(code)
+        if g is None:
+            await ws_send_json(conn, {"type": "error", "message": f"群号 {code} 不存在"})
+            return
+        db.execute(
+            "INSERT OR IGNORE INTO group_members(group_id, device_id) VALUES(?, ?)",
+            (g["id"], conn.device_id),
+        )
+        db.commit()
+        conn.member_groups.add(g["id"])
+        if conn.active_group_id is None:
+            conn.active_group_id = g["id"]
+            db.execute(
+                "UPDATE devices SET active_group_id = ? WHERE id = ?",
+                (g["id"], conn.device_id),
+            )
+            db.commit()
+        await push_groups(conn)
+        log.info("设备 %s 凭群号 %s 加入群组 %d", conn.device_id, code, g["id"])
 
     elif t == "list_groups":
         await push_groups(conn)
@@ -406,9 +487,10 @@ async def create_group(body: dict):
     name = str(body.get("name", "")).strip()
     if not name:
         raise HTTPException(400, "群组名不能为空")
-    cur = db.execute("INSERT INTO groups(name) VALUES(?)", (name,))
+    gid = allocate_group_id()
+    db.execute("INSERT INTO groups(id, name) VALUES(?, ?)", (gid, name))
     db.commit()
-    return {"id": cur.lastrowid, "name": name, "members": []}
+    return {"id": gid, "name": name, "members": []}
 
 
 @app.patch("/api/groups/{group_id}")

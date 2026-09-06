@@ -157,8 +157,13 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t len) {
         case WStype_CONNECTED: {
             wsOk = true;
             Serial.printf("[WS] 已连接: %s\n", (char *)payload);
+            // hello:服务器按 MAC 识别设备;join_code 让服务器自动把本机拉进群组
             String hello = String("{\"type\":\"hello\",\"mac\":\"") +
-                           WiFi.macAddress() + "\",\"proto\":1}";
+                           WiFi.macAddress() + "\",\"proto\":1";
+            if (strlen(JOIN_GROUP_CODE) > 0) {
+                hello += String(",\"join_code\":\"") + JOIN_GROUP_CODE + "\"";
+            }
+            hello += "}";
             ws.sendTXT(hello);
             break;
         }

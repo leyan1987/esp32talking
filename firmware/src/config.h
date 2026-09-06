@@ -10,6 +10,11 @@
 #define SERVER_PORT   8000
 #define SERVER_PATH   "/ws"
 
+// ==== 群组 ====
+// 填 6 位群号(如 "382746"),设备连接时自动加入该群组;留空 "" 则由
+// 管理台(http://服务器IP:8000/)手动把本机拉进群组
+#define JOIN_GROUP_CODE ""
+
 // ==== 按键 / LED ====
 #define PTT_BTN_PIN     4    // 按键一端接 GPIO4,另一端接 GND
 #define STATUS_LED_PIN  2    // 多数 DevKit 板载 LED

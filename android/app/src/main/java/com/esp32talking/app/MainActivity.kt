@@ -66,6 +66,8 @@ class MainActivity : Activity() {
     private lateinit var btnConnect: Button
     private lateinit var btnPtt: Button
     private lateinit var spGroup: Spinner
+    private lateinit var btnCreateGroup: Button
+    private lateinit var btnJoinGroup: Button
     private lateinit var btnRenameGroup: Button
 
     private val ui = Handler(Looper.getMainLooper())
@@ -110,6 +112,8 @@ class MainActivity : Activity() {
         btnConnect = findViewById(R.id.btnConnect)
         btnPtt = findViewById(R.id.btnPtt)
         spGroup = findViewById(R.id.spGroup)
+        btnCreateGroup = findViewById(R.id.btnCreateGroup)
+        btnJoinGroup = findViewById(R.id.btnJoinGroup)
         btnRenameGroup = findViewById(R.id.btnRenameGroup)
 
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
@@ -133,6 +137,8 @@ class MainActivity : Activity() {
             override fun onNothingSelected(parent: AdapterView<*>?) {}
         }
 
+        btnCreateGroup.setOnClickListener { showCreateGroupDialog() }
+        btnJoinGroup.setOnClickListener { showJoinGroupDialog() }
         btnRenameGroup.setOnClickListener { showRenameDialog() }
 
         btnPtt.setOnTouchListener { _, e ->
@@ -242,6 +248,15 @@ class MainActivity : Activity() {
                 val reason = obj.optString("reason", "被拒绝")
                 ui.post { toast("服务器拒绝: $reason") }
             }
+            "created" -> {
+                // 新建群组成功,告知群号方便分享给其他人
+                val gid = obj.optInt("group_id")
+                val name = obj.optString("name", "")
+                ui.post { toast("已创建「$name」,群号 $gid,把号码告诉别人即可加入") }
+            }
+            "error" -> {
+                ui.post { toast(obj.optString("message", "操作失败")) }
+            }
         }
     }
 
@@ -252,13 +267,60 @@ class MainActivity : Activity() {
         spinnerBusy = true
         val names =
             if (groups.isEmpty()) mutableListOf("(未加入群组)")
-            else groups.map { it.name }.toMutableList()
+            else groups.map { "${it.name} (${it.id})" }.toMutableList()
         spGroup.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, names)
         val idx = active?.let { a -> groups.indexOfFirst { it.id == a } }
             ?.takeIf { it >= 0 } ?: 0
         if (groups.isNotEmpty()) spGroup.setSelection(idx, false)
         activeGroupId = groups.getOrNull(idx)?.id
         spinnerBusy = false
+    }
+
+    /** 新建群组:创建后本机自动加入并切换为当前群组 */
+    private fun showCreateGroupDialog() {
+        if (ws == null) {
+            toast("请先连接服务器")
+            return
+        }
+        val input = EditText(this)
+        input.hint = "群组名称"
+        AlertDialog.Builder(this)
+            .setTitle("新建群组")
+            .setView(input)
+            .setPositiveButton("创建") { _, _ ->
+                val name = input.text.toString().trim()
+                if (name.isNotEmpty()) {
+                    ws?.send(JSONObject().put("type", "create_group").put("name", name).toString())
+                } else {
+                    toast("群组名不能为空")
+                }
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /** 凭 6 位群号加入群组 */
+    private fun showJoinGroupDialog() {
+        if (ws == null) {
+            toast("请先连接服务器")
+            return
+        }
+        val input = EditText(this)
+        input.hint = "6 位群号,如 382746"
+        input.inputType = android.text.InputType.TYPE_CLASS_NUMBER
+        AlertDialog.Builder(this)
+            .setTitle("加入群组")
+            .setView(input)
+            .setPositiveButton("加入") { _, _ ->
+                val code = input.text.toString().trim()
+                if (code.isNotEmpty() && code.all { it.isDigit() }) {
+                    ws?.send(JSONObject().put("type", "join_group").put("code", code).toString())
+                } else {
+                    toast("请输入数字群号")
+                }
+            }
+            .setNegativeButton("取消", null)
+            .show()
     }
 
     private fun showRenameDialog() {
