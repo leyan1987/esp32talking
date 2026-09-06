@@ -24,7 +24,9 @@ static bool wsOk = false;
 static bool talking = false;
 static uint32_t lastWsTry = 0;
 
-// ---------- 播放环形缓冲(容量 64KB ≈ 4 秒) ----------
+// ---------- 播放环形缓冲 ----------
+// 裸 PCM 32KB/s 下 64KB ≈ 2 秒;96KB 会使经典 ESP32 的 DRAM 溢出,
+// M3 接入 ADPCM(8KB/s)后等效时长 ×4,届时可再加大
 #define RING_SIZE (64 * 1024)
 static uint8_t ringBuf[RING_SIZE];
 static size_t ringHead = 0;  // 写入位置
