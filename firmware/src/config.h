@@ -30,6 +30,12 @@
 // 硬件上也可把 MAX98357A 的 GAIN 引脚接 GND(输出再 +3dB)。
 #define MIC_GAIN_SHIFT 12
 
+// ==== ADPCM 压缩 (M3) ====
+// 1 = 采集后用 IMA ADPCM 压缩:上行带宽 32KB/s -> 8KB/s,接收缓冲时长 x4
+// 0 = 回退裸 PCM(排查问题时用)
+// 播放端按帧长自动识别 PCM(640字节)/ADPCM(164字节),新旧固件混用时兼容
+#define USE_ADPCM 1
+
 // ==== INMP441 麦克风 (I2S0 接收) ====
 // VDD->3.3V  GND->GND  L/R->GND
 #define MIC_BCLK_PIN 14    // INMP441 SCK

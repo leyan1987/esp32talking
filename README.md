@@ -17,9 +17,9 @@
 - ✅ **话权控制(M3)**:同组同时只允许一人说话;按键先申请话权(先到先得),松开释放;**设备优先级 0~9,高者可抢占**;持话权 15 秒无音频自动释放;未授权音频被服务器丢弃
 - ✅ Web 管理台:浏览器打开 `http://<服务器IP>:8000/`,**登录后使用**(默认密码 `admin123`,请立即修改)
 - ✅ 安卓端:新建群组 / 群号加入 / 切换当前群组 / 群组改名 / 群成员在线状态 / 自改昵称 / 话权等待与抢占提示
+- ✅ **ADPCM 压缩(M3)**:IMA ADPCM 4:1,上行/下行带宽 32KB/s → **8KB/s**;帧头自带解码状态,丢帧不扩散;接收端按帧长自动识别新(ADPCM 164 字节)/旧(PCM 640 字节)格式;ESP32 播放缓冲等效时长 ×4(约 8 秒);语音 SNR 实测约 30dB
 - ✅ 安卓保活:前台服务 + CPU/WiFi 锁,灭屏、划掉 App 后仍保持在线
 - ✅ 设备身份:安卓用 ANDROID_ID 派生稳定 ID,重装 App 不丢群组
-- ⏳ M3 剩余:ADPCM 压缩(带宽降 75%)
 
 ## 快速开始
 
@@ -61,6 +61,7 @@ python -m venv .venv
    pio run -t upload && pio device monitor
    ```
 3. 音量调节(`config.h` 的 `MIC_GAIN_SHIFT`):16=0dB、14=+12dB、12=+24dB(当前默认),数值越小越响;爆音则调大
+4. `config.h` 的 `USE_ADPCM 1` 开启压缩(默认);排查问题时可改 0 回退裸 PCM。**注意:压缩需固件与安卓两端同时更新,旧版混用时音频无法正常播放**
 
 ### 安卓客户端
 
@@ -82,7 +83,7 @@ python -m venv .venv
 
 - 文本帧 JSON:`hello{id,kind,join_code?}` → `welcome{device,groups,active_group_id}`(join_code 存在时自动入群);`create_group{name}` → `created{group_id,name}` + `groups{...}`;`join_group{code}` → `groups{...}`(群号错误回 `error`);`select_group{group_id}`、`list_groups` → `groups{...}`;`set_name{name}` → `device_info`;`rename_group{group_id,name}`(仅限自己所在群组)、`list_members{group_id}` → `members{...}`;被禁用收 `rejected{reason}` 后被断开
 - **话权(M3)**:`ptt_request` → `ptt_grant` 或 `ptt_deny{holder_name}`;`ptt_release` 释放;被抢占收 `ptt_revoke`;群内广播 `ptt_status{held,holder_name}`;未持话权的音频帧被服务器丢弃
-- 二进制帧:640 字节 PCM,服务器按发送方"当前群组"转发给同组其他在线成员,不回发给发送方
+- 二进制帧:**ADPCM 164 字节**(M3,4 字节状态头 + 160 字节数据)或裸 PCM 640 字节(旧客户端兼容),接收端按帧长自动识别;服务器按发送方"当前群组"原样转发给同组其他在线成员,不回发给发送方
 
 ## 硬件清单(每台 ESP32 设备)
 

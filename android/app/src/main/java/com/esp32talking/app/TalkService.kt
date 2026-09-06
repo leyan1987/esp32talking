@@ -110,6 +110,7 @@ class TalkService : Service() {
     private val talking = AtomicBoolean(false)
     private var record: AudioRecord? = null
     private var recordThread: Thread? = null
+    private val encState = IntArray(2)             // ADPCM 跨帧状态
 
     // ---- 话权(M3):按键先申请,授权后才开始采集 ----
     @Volatile private var pendingTalk = false
@@ -460,17 +461,25 @@ class TalkService : Service() {
 
         recordThread = Thread {
             val shortBuf = ShortArray(FRAME_SAMPLES)
-            val byteBuf = ByteArray(FRAME_BYTES)
+            val pcmBytes = ByteArray(FRAME_BYTES)
+            val adpcmOut = ByteArray(Adpcm.ADPCM_BYTES)
             while (talking.get()) {
                 val n = rec.read(shortBuf, 0, FRAME_SAMPLES)
                 if (n <= 0) continue
-                var j = 0
-                for (i in 0 until n) {
-                    val v = shortBuf[i]
-                    byteBuf[j++] = (v.toInt() and 0xFF).toByte()
-                    byteBuf[j++] = ((v.toInt() shr 8) and 0xFF).toByte()
+                if (n == FRAME_SAMPLES) {
+                    // M3:IMA ADPCM 压缩后上行(164 字节),服务器原样转发
+                    Adpcm.encode(shortBuf, encState, adpcmOut)
+                    ws?.send(adpcmOut.toByteString())
+                } else {
+                    // 采样数不足一帧(罕见):按 PCM 兜底发送
+                    var j = 0
+                    for (i in 0 until n) {
+                        val v = shortBuf[i]
+                        pcmBytes[j++] = (v.toInt() and 0xFF).toByte()
+                        pcmBytes[j++] = ((v.toInt() shr 8) and 0xFF).toByte()
+                    }
+                    ws?.send(pcmBytes.toByteString(0, n * 2))
                 }
-                ws?.send(byteBuf.toByteString(0, n * 2))
             }
             try {
                 rec.stop()
@@ -588,15 +597,33 @@ class TalkService : Service() {
         t.play()
 
         playerThread = Thread {
+            val decodeOut = ShortArray(Adpcm.FRAME_SAMPLES)
+            val decodedBytes = ByteArray(Adpcm.FRAME_BYTES)
             while (!Thread.currentThread().isInterrupted) {
                 val chunk: ByteArray? = synchronized(playLock) {
                     if (talking.get() || playQueue.isEmpty()) null else playQueue.removeFirst()
                 }
                 if (chunk == null) {
                     Thread.sleep(10)
-                } else {
-                    applyGain(chunk)
-                    t.write(chunk, 0, chunk.size)
+                    continue
+                }
+                val pcm: ByteArray? = when (chunk.size) {
+                    // 按帧长自动识别:M3 = ADPCM,旧客户端 = 裸 PCM
+                    Adpcm.ADPCM_BYTES -> {
+                        Adpcm.decode(chunk, decodeOut)
+                        for (i in 0 until Adpcm.FRAME_SAMPLES) {
+                            val v = decodeOut[i].toInt()
+                            decodedBytes[2 * i] = (v and 0xFF).toByte()
+                            decodedBytes[2 * i + 1] = ((v shr 8) and 0xFF).toByte()
+                        }
+                        decodedBytes
+                    }
+                    Adpcm.FRAME_BYTES -> chunk
+                    else -> null
+                }
+                if (pcm != null) {
+                    applyGain(pcm)
+                    t.write(pcm, 0, pcm.size)
                 }
             }
         }.also { it.start() }
