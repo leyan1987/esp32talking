@@ -13,6 +13,7 @@ import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.AutomaticGainControl
+import android.media.audiofx.NoiseSuppressor
 import android.net.wifi.WifiManager
 import android.os.Binder
 import android.os.Handler
@@ -113,9 +114,10 @@ class TalkService : Service() {
         // 接收端自动响度:把语音拉到目标 RMS,抵消发送端波动/AGC 造成
         // 的"前几句正常、后来越来越小"
         private const val TARGET_RMS = 1500f      // 约 -27dBFS
-        private const val RMS_FLOOR = 300f        // 低于此视为静音,不调整
+        private const val RMS_FLOOR = 400f        // 低于此视为静音,不调整
         private const val AUTO_GAIN_MIN = 0.5f
         private const val AUTO_GAIN_MAX = 4f
+        private const val LIMIT_CEILING = 31000f  // 峰值限制器天花板(约 -0.5dBFS)
         const val ACTION_CONNECT = "com.esp32talking.app.CONNECT"
         const val EXTRA_URL = "url"
     }
@@ -171,6 +173,11 @@ class TalkService : Service() {
     private var record: AudioRecord? = null
     private var recordThread: Thread? = null
     private val encState = IntArray(2)             // ADPCM 跨帧状态
+
+    // 音效对象必须持有引用,否则被 GC 回收后设置会失效
+    private var noiseSuppressor: NoiseSuppressor? = null
+    private var agcEffect: AutomaticGainControl? = null
+    private var aecEffect: AcousticEchoCanceler? = null
 
     // ---- 话权(M3):按键先申请,授权后才开始采集 ----
     @Volatile private var pendingTalk = false
@@ -596,18 +603,29 @@ class TalkService : Service() {
             AudioFormat.ENCODING_PCM_16BIT,
             maxOf(minBuf, FRAME_BYTES * 4)
         )
-        // 设备支持时再明确关闭 AGC/回声消除(半双工对讲无回声问题,不需要它们)
-        try {
-            if (AutomaticGainControl.isAvailable()) {
-                AutomaticGainControl.create(rec.audioSessionId).setEnabled(false)
-            }
+        // 音效:噪声抑制开启(去稳态底噪);AGC/回声消除保持关闭——
+        // 半双工不需要回声消除,AGC 会把说得久的句子自动压小(实测问题)。
+        // 音效对象存到字段防止被 GC 回收导致设置失效。
+        noiseSuppressor = try {
+            if (NoiseSuppressor.isAvailable())
+                NoiseSuppressor.create(rec.audioSessionId).apply { setEnabled(true) }
+            else null
         } catch (_: Exception) {
+            null
         }
-        try {
-            if (AcousticEchoCanceler.isAvailable()) {
-                AcousticEchoCanceler.create(rec.audioSessionId).setEnabled(false)
-            }
+        agcEffect = try {
+            if (AutomaticGainControl.isAvailable())
+                AutomaticGainControl.create(rec.audioSessionId).apply { setEnabled(false) }
+            else null
         } catch (_: Exception) {
+            null
+        }
+        aecEffect = try {
+            if (AcousticEchoCanceler.isAvailable())
+                AcousticEchoCanceler.create(rec.audioSessionId).apply { setEnabled(false) }
+            else null
+        } catch (_: Exception) {
+            null
         }
         record = rec
         rec.startRecording()
@@ -661,6 +679,12 @@ class TalkService : Service() {
         recordThread?.join(500)
         recordThread = null
         record = null
+        try { noiseSuppressor?.release() } catch (_: Exception) {}
+        try { agcEffect?.release() } catch (_: Exception) {}
+        try { aecEffect?.release() } catch (_: Exception) {}
+        noiseSuppressor = null
+        agcEffect = null
+        aecEffect = null
     }
 
     private fun stopTalkingInternal() {
@@ -682,18 +706,22 @@ class TalkService : Service() {
     fun gainLabel(): String = "音量x${GAIN_STEPS[gainIdx].toInt()}"
 
     /**
-     * 接收端自动响度 + 手动增益:
-     * 先按帧 RMS 缓慢调整 autoGain(上调慢防把间隙噪声抬起来,下调快防炸),
-     * 再乘上用户手动档位,最后削波保护。
+     * 接收端自动响度 + 手动增益 + 峰值限制器:
+     * 1) 按帧 RMS 缓慢调整 autoGain(抬升慢防止把间隙噪声抬起来,压低快防炸);
+     * 2) 最终增益 = 手动档位 × 自动增益,再做峰值限制器——
+     *    无论手动开到几档都不会削波爆音。
      */
     private fun applyGain(chunk: ByteArray) {
         var sum = 0.0
+        var peak = 1
         var i = 0
         while (i < chunk.size) {
             val lo = chunk[i].toInt() and 0xFF
             val hi = chunk[i + 1].toInt()
             val s = (hi shl 8) or lo
             sum += (s * s).toDouble()
+            val a = if (s < 0) -s else s
+            if (a > peak) peak = a
             i += 2
         }
         val n = (chunk.size / 2).coerceAtLeast(1)
@@ -703,10 +731,11 @@ class TalkService : Service() {
             autoGain = if (desired > autoGain) {
                 autoGain + (desired - autoGain) * 0.04f
             } else {
-                autoGain + (desired - autoGain) * 0.30f
+                autoGain + (desired - autoGain) * 0.45f
             }
         }
-        val g = GAIN_STEPS[gainIdx] * autoGain
+        val limiterGain = LIMIT_CEILING / peak
+        val g = kotlin.math.min(GAIN_STEPS[gainIdx] * autoGain, limiterGain)
         if (g <= 0.99f || g >= 1.01f) {
             var j = 0
             while (j < chunk.size) {
