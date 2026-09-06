@@ -28,6 +28,7 @@ import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import org.json.JSONObject
+import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -58,6 +59,7 @@ class TalkService : Service() {
 
     interface Listener {
         fun onStatus(status: String)
+        fun onDeviceInfo(name: String)
         fun onGroups(groups: List<GroupInfo>, activeGroupId: Int?)
         fun onCreated(groupId: Int, name: String)
         fun onError(message: String)
@@ -87,6 +89,7 @@ class TalkService : Service() {
 
     private val groups = mutableListOf<GroupInfo>()
     private var activeGroupId: Int? = null
+    private var myDeviceName: String? = null
 
     // ---- 采集 ----
     private val talking = AtomicBoolean(false)
@@ -140,6 +143,7 @@ class TalkService : Service() {
         // 绑定后立即同步当前状态(例如从划掉的界面重新打开)
         ui.post {
             l.onStatus(statusText)
+            l.onDeviceInfo(myDeviceName ?: "")
             l.onGroups(groups.toList(), activeGroupId)
             l.onTalkingChanged(talking.get())
         }
@@ -186,6 +190,15 @@ class TalkService : Service() {
             return
         }
         ws?.send(JSONObject().put("type", "join_group").put("code", code).toString())
+    }
+
+    /** 修改自己的昵称(设备显示名),成功后服务器回 device_info */
+    fun setName(name: String) {
+        if (ws == null) {
+            notifyError("请先连接服务器")
+            return
+        }
+        ws?.send(JSONObject().put("type", "set_name").put("name", name).toString())
     }
 
     /** 通过 REST 改群组名,成功后刷新群组列表 */
@@ -285,6 +298,9 @@ class TalkService : Service() {
         val obj = runCatching { JSONObject(text) }.getOrNull() ?: return
         when (obj.optString("type")) {
             "welcome", "groups" -> {
+                obj.optJSONObject("device")?.optString("name")?.let {
+                    if (it.isNotEmpty()) myDeviceName = it
+                }
                 val arr = obj.optJSONArray("groups") ?: return
                 val list = mutableListOf<GroupInfo>()
                 for (i in 0 until arr.length()) {
@@ -294,7 +310,16 @@ class TalkService : Service() {
                 val active =
                     if (obj.has("active_group_id") && !obj.isNull("active_group_id"))
                         obj.getInt("active_group_id") else null
-                ui.post { updateGroups(list, active) }
+                val nameSnapshot = myDeviceName
+                ui.post {
+                    if (nameSnapshot != null) listeners.forEach { it.onDeviceInfo(nameSnapshot) }
+                    updateGroups(list, active)
+                }
+            }
+            "device_info" -> {
+                myDeviceName = obj.optString("name", "")
+                val nameSnapshot = myDeviceName
+                ui.post { listeners.forEach { it.onDeviceInfo(nameSnapshot ?: "") } }
             }
             "created" -> {
                 val gid = obj.optInt("group_id")
@@ -495,10 +520,22 @@ class TalkService : Service() {
 
     // ---------------- 杂项 ----------------
 
+    /**
+     * 设备唯一 ID。
+     * 优先用 ANDROID_ID 派生:同一签名重装 App 后不变(恢复出厂或换签名才会变),
+     * 因此重装后服务器仍能认出这台设备,群组关系不丢。
+     * ANDROID_ID 不可用时回退到持久化随机 UUID。
+     */
     private fun deviceId(): String {
         val p = getSharedPreferences(PREFS, MODE_PRIVATE)
+        val aid = android.provider.Settings.Secure.getString(
+            contentResolver, android.provider.Settings.Secure.ANDROID_ID
+        )
+        if (!aid.isNullOrEmpty() && aid != "9774d56d682e549c" && aid.length >= 8) {
+            return UUID.nameUUIDFromBytes(aid.toByteArray()).toString()
+        }
         p.getString("device_id", null)?.let { return it }
-        val id = java.util.UUID.randomUUID().toString()
+        val id = UUID.randomUUID().toString()
         p.edit().putString("device_id", id).apply()
         return id
     }

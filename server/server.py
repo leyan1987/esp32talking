@@ -15,10 +15,12 @@
   C->S  {"type":"select_group","group_id":N}     切换当前群组(监听/通讯目标)
   C->S  {"type":"create_group","name":".."}      新建群组(创建者自动加入并切换)
   C->S  {"type":"join_group","code":"123456"}    凭 6 位群号加入群组
+  C->S  {"type":"set_name","name":"老王"}         客户端自改昵称(设备显示名)
   C->S  {"type":"list_groups"}                   请求刷新自己的群组列表
   S->C  {"type":"welcome","device":{...},"groups":[..],"active_group_id":N}
   S->C  {"type":"groups","groups":[..],"active_group_id":N}  群组变更推送
   S->C  {"type":"created","group_id":N,"name":".."}
+  S->C  {"type":"device_info","id":"..","name":".."}         昵称已更新
   S->C  {"type":"error","message":".."}
   S->C  {"type":"rejected","reason":".."}        随后断开(设备被禁用)
   S->C  {"type":"ack","echo":".."}               M1 兼容应答
@@ -331,6 +333,19 @@ async def handle_text(conn: Conn, text: str) -> None:
             db.commit()
         await push_groups(conn)
         log.info("设备 %s 凭群号 %s 加入群组 %d", conn.device_id, code, g["id"])
+
+    elif t == "set_name":
+        # 客户端自改昵称(管理台改名依然有效,后改的生效)
+        name = str(obj.get("name", "")).strip()[:20]
+        if not name:
+            await ws_send_json(conn, {"type": "error", "message": "昵称不能为空"})
+            return
+        db.execute("UPDATE devices SET name = ? WHERE id = ?", (name, conn.device_id))
+        db.commit()
+        await ws_send_json(
+            conn, {"type": "device_info", "id": conn.device_id, "name": name}
+        )
+        log.info("设备 %s 修改昵称 -> %s", conn.device_id, name)
 
     elif t == "list_groups":
         await push_groups(conn)

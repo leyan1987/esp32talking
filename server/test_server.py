@@ -152,6 +152,19 @@ async def main() -> int:
     assert d1["name"] == "ESP32-客厅", d1
     print("9. 设备列表 OK")
 
+    # 9b) 客户端自改昵称(set_name)
+    async with websockets.connect(URI) as w1:
+        await hello_device(w1, D1)
+        await w1.send(json.dumps({"type": "set_name", "name": "  老王的手机  "}))
+        resp = await recv_json(w1)
+        assert resp["type"] == "device_info" and resp["name"] == "老王的手机", resp
+        await w1.send(json.dumps({"type": "set_name", "name": "   "}))
+        err = await recv_json(w1)
+        assert err["type"] == "error", err
+        devs = api("GET", "/devices")["devices"]
+        assert next(d for d in devs if d["id"] == D1)["name"] == "老王的手机"
+        print("9b. 客户端自改昵称 OK(空昵称报 error)")
+
     # 10) 禁用 -> 踢下线 -> 重连被拒 -> 启用恢复
     async with websockets.connect(URI) as w2:
         await hello_device(w2, D2)

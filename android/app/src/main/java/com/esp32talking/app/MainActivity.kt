@@ -53,6 +53,8 @@ class MainActivity : Activity() {
     }
 
     private lateinit var tvStatus: TextView
+    private lateinit var tvMyName: TextView
+    private lateinit var btnMyName: Button
     private lateinit var etServer: EditText
     private lateinit var btnConnect: Button
     private lateinit var btnPtt: Button
@@ -78,6 +80,10 @@ class MainActivity : Activity() {
         override fun onStatus(status: String) = runOnUiThread {
             tvStatus.text = status
             btnConnect.text = if (svc?.isConnected() == true) "断开" else "连接服务器"
+        }
+
+        override fun onDeviceInfo(name: String) = runOnUiThread {
+            tvMyName.text = if (name.isEmpty()) "昵称: -" else "昵称: $name"
         }
 
         override fun onGroups(list: List<GroupInfo>, active: Int?) = runOnUiThread {
@@ -115,6 +121,8 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
         tvStatus = findViewById(R.id.tvStatus)
+        tvMyName = findViewById(R.id.tvMyName)
+        btnMyName = findViewById(R.id.btnMyName)
         etServer = findViewById(R.id.etServer)
         btnConnect = findViewById(R.id.btnConnect)
         btnPtt = findViewById(R.id.btnPtt)
@@ -164,6 +172,9 @@ class MainActivity : Activity() {
         }
         btnMembers.setOnClickListener {
             showMembersDialog()
+        }
+        btnMyName.setOnClickListener {
+            showNicknameDialog()
         }
 
         btnPtt.setOnTouchListener { _, e ->
@@ -252,6 +263,27 @@ class MainActivity : Activity() {
         if (groups.isNotEmpty()) spGroup.setSelection(idx, false)
         activeGroupId = groups.getOrNull(idx)?.id
         spinnerBusy = false
+    }
+
+    /** 修改自己的昵称 */
+    private fun showNicknameDialog() {
+        if (svc?.isConnected() != true) {
+            toast("请先连接服务器")
+            return
+        }
+        val input = EditText(this)
+        input.hint = "最多 20 个字"
+        val current = tvMyName.text.toString().removePrefix("昵称: ")
+        if (current.isNotEmpty() && current != "-") input.setText(current)
+        AlertDialog.Builder(this)
+            .setTitle("修改我的昵称")
+            .setView(input)
+            .setPositiveButton("确定") { _, _ ->
+                val name = input.text.toString().trim()
+                if (name.isNotEmpty()) svc?.setName(name) else toast("昵称不能为空")
+            }
+            .setNegativeButton("取消", null)
+            .show()
     }
 
     private fun showCreateGroupDialog() {
