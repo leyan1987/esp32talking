@@ -156,10 +156,12 @@ function render() {
     const members = el('td');
     if (g.members.length === 0) members.textContent = '(空)';
     for (const m of g.members) {
-      members.appendChild(el('span', { class: 'chip' },
-        document.createTextNode(m.name + ' (' + m.id.slice(-4) + ')'),
-        el('button', { text: '×', title: '移出', onclick: () => api('DELETE', `/api/groups/${g.id}/members/${m.id}`).then(refresh).catch(e2 => toast(e2.message)) })
-      ));
+      const chip = el('span', { class: 'chip' });
+      const dot = el('span', { text: m.online ? '● ' : '○ ', style: 'color:' + (m.online ? '#0a0' : '#bbb') + ';font-size:11px;' });
+      chip.appendChild(dot);
+      chip.appendChild(document.createTextNode(m.name + ' (' + m.id.slice(-4) + ')'));
+      chip.appendChild(el('button', { text: '×', title: '移出', onclick: () => api('DELETE', `/api/groups/${g.id}/members/${m.id}`).then(refresh).catch(e2 => toast(e2.message)) }));
+      members.appendChild(chip);
     }
 
     const addCell = el('td');

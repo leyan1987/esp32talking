@@ -476,7 +476,10 @@ async def list_groups():
             {
                 "id": g["id"],
                 "name": g["name"],
-                "members": [{"id": m["id"], "name": m["name"]} for m in members],
+                "members": [
+                    {"id": m["id"], "name": m["name"], "online": m["id"] in conn_by_device}
+                    for m in members
+                ],
             }
         )
     return {"groups": out}

@@ -68,6 +68,14 @@
             android:text="群号加入" />
 
         <Button
+            android:id="@+id/btnMembers"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="6dp"
+            android:layout_weight="1"
+            android:text="成员" />
+
+        <Button
             android:id="@+id/btnRenameGroup"
             android:layout_width="0dp"
             android:layout_height="wrap_content"

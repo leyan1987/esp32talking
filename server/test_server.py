@@ -105,7 +105,12 @@ async def main() -> int:
         got = await asyncio.wait_for(w2.recv(), 5)
         assert got == frame, "群组内互通失败"
         await expect_silence(w1)
-        print("4. 按当前群组路由 + 同组互通 + 无自环 OK")
+        # 成员在线状态(REST /api/groups 成员带 online 字段)
+        glist = api("GET", "/groups")["groups"]
+        gA = next(g for g in glist if g["id"] == g1["id"])
+        assert next(m for m in gA["members"] if m["id"] == D1)["online"] is True
+        assert next(m for m in gA["members"] if m["id"] == D2)["online"] is True
+        print("4. 按当前群组路由 + 同组互通 + 无自环 + 在线状态 OK")
 
         # 5) WS create_group:创建者自动加入并切换为当前群组
         await w1.send(json.dumps({"type": "create_group", "name": "测试组"}))
