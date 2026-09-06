@@ -11,6 +11,8 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.AutomaticGainControl
 import android.net.wifi.WifiManager
 import android.os.Binder
 import android.os.Handler
@@ -56,6 +58,12 @@ class TalkService : Service() {
         // 软件播放增益档位(不同 ROM 外放差异大,靠放大 PCM 兜底)
         private val GAIN_STEPS = floatArrayOf(1f, 2f, 3f, 4f)
         private const val KEY_GAIN = "gain_idx"
+        // 接收端自动响度:把语音拉到目标 RMS,抵消发送端波动/AGC 造成
+        // 的"前几句正常、后来越来越小"
+        private const val TARGET_RMS = 1500f      // 约 -27dBFS
+        private const val RMS_FLOOR = 300f        // 低于此视为静音,不调整
+        private const val AUTO_GAIN_MIN = 0.5f
+        private const val AUTO_GAIN_MAX = 4f
         const val ACTION_CONNECT = "com.esp32talking.app.CONNECT"
         const val EXTRA_URL = "url"
     }
@@ -105,6 +113,7 @@ class TalkService : Service() {
     private val playQueue = ArrayDeque<ByteArray>()
     private val playLock = Object()
     private var gainIdx = 0
+    private var autoGain = 1f
 
     // ---- 保活锁 ----
     private var wakeLock: PowerManager.WakeLock? = null
@@ -373,13 +382,28 @@ class TalkService : Service() {
         val minBuf = AudioRecord.getMinBufferSize(
             SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
         )
+        // 用原始 MIC 源:VOICE_COMMUNICATION 自带 AGC 自动增益,
+        // 会把说得久/说得响的后续句子自动压小(实测"前几句正常,后来越来越小")
         val rec = AudioRecord(
-            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+            MediaRecorder.AudioSource.MIC,
             SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
             maxOf(minBuf, FRAME_BYTES * 4)
         )
+        // 设备支持时再明确关闭 AGC/回声消除(半双工对讲无回声问题,不需要它们)
+        try {
+            if (AutomaticGainControl.isAvailable()) {
+                AutomaticGainControl.create(rec.audioSessionId).setEnabled(false)
+            }
+        } catch (_: Exception) {
+        }
+        try {
+            if (AcousticEchoCanceler.isAvailable()) {
+                AcousticEchoCanceler.create(rec.audioSessionId).setEnabled(false)
+            }
+        } catch (_: Exception) {
+        }
         record = rec
         rec.startRecording()
 
@@ -436,21 +460,45 @@ class TalkService : Service() {
 
     fun gainLabel(): String = "音量x${GAIN_STEPS[gainIdx].toInt()}"
 
-    /** 就地放大 PCM16 数据,带削波保护 */
+    /**
+     * 接收端自动响度 + 手动增益:
+     * 先按帧 RMS 缓慢调整 autoGain(上调慢防把间隙噪声抬起来,下调快防炸),
+     * 再乘上用户手动档位,最后削波保护。
+     */
     private fun applyGain(chunk: ByteArray) {
-        val g = GAIN_STEPS[gainIdx]
-        if (g <= 1f) return
+        var sum = 0.0
         var i = 0
         while (i < chunk.size) {
             val lo = chunk[i].toInt() and 0xFF
             val hi = chunk[i + 1].toInt()
-            var sample = ((hi shl 8) or lo) * g
-            if (sample > 32767f) sample = 32767f
-            if (sample < -32768f) sample = -32768f
-            val s = sample.toInt()
-            chunk[i] = (s and 0xFF).toByte()
-            chunk[i + 1] = ((s shr 8) and 0xFF).toByte()
+            val s = (hi shl 8) or lo
+            sum += (s * s).toDouble()
             i += 2
+        }
+        val n = (chunk.size / 2).coerceAtLeast(1)
+        val rms = kotlin.math.sqrt(sum / n).toFloat()
+        if (rms > RMS_FLOOR) {
+            val desired = (TARGET_RMS / rms).coerceIn(AUTO_GAIN_MIN, AUTO_GAIN_MAX)
+            autoGain = if (desired > autoGain) {
+                autoGain + (desired - autoGain) * 0.04f
+            } else {
+                autoGain + (desired - autoGain) * 0.30f
+            }
+        }
+        val g = GAIN_STEPS[gainIdx] * autoGain
+        if (g <= 0.99f || g >= 1.01f) {
+            var j = 0
+            while (j < chunk.size) {
+                val lo = chunk[j].toInt() and 0xFF
+                val hi = chunk[j + 1].toInt()
+                var sample = ((hi shl 8) or lo) * g
+                if (sample > 32767f) sample = 32767f
+                if (sample < -32768f) sample = -32768f
+                val s = sample.toInt()
+                chunk[j] = (s and 0xFF).toByte()
+                chunk[j + 1] = ((s shr 8) and 0xFF).toByte()
+                j += 2
+            }
         }
     }
 
