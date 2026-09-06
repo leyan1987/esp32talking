@@ -89,7 +89,7 @@ python -m venv .venv
 
 ### 4. 安卓客户端
 
-- 安装 [`android/app/build/outputs/apk/debug/app-debug.apk`](android/app/build/outputs/apk/debug/app-debug.apk)(需自行构建)或用 Android Studio 打开 `android/` 构建
+- 直接从 [Releases](https://github.com/leyan1987/esp32talking/releases/latest) 下载 APK 传到手机安装(需允许"安装未知应用");或用 Android Studio 打开 `android/` 自行构建
 - 填服务器地址 `ws://<服务器IP>:8000/ws` → 连接 → 允许麦克风/通知权限
 - 群组操作都在 App 内:新建群组(自动分配 6 位群号)/ 群号加入 / 切换当前群组 / 改名
 
