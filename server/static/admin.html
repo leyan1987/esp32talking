@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>esp32talking 管理台</title>
+<style>
+  body { font-family: "Microsoft YaHei", system-ui, sans-serif; margin: 24px; color: #222; }
+  h1 { font-size: 22px; } h2 { font-size: 17px; margin-top: 28px; border-bottom: 2px solid #eee; padding-bottom: 6px; }
+  table { border-collapse: collapse; width: 100%; margin-top: 10px; }
+  th, td { border: 1px solid #ddd; padding: 6px 10px; font-size: 14px; text-align: left; }
+  th { background: #f5f5f5; }
+  .on { color: #0a0; font-weight: bold; } .off { color: #999; }
+  .dis { color: #c00; }
+  input, select, button { padding: 5px 8px; font-size: 14px; }
+  button { cursor: pointer; }
+  .mini { font-size: 12px; padding: 3px 8px; }
+  .row-form { margin: 10px 0; display: flex; gap: 8px; flex-wrap: wrap; }
+  .chip { display: inline-block; background: #eef; border: 1px solid #ccd; border-radius: 10px; padding: 1px 8px; margin: 1px 3px; font-size: 12px; }
+  .chip button { border: none; background: none; color: #c00; padding: 0 0 0 4px; font-size: 12px; }
+  .toast { position: fixed; top: 12px; right: 12px; background: #333; color: #fff; padding: 8px 14px; border-radius: 6px; display: none; font-size: 14px; }
+  small.hint { color: #888; }
+</style>
+</head>
+<body>
+<h1>esp32talking 管理台 <small class="hint" id="onlineHint"></small></h1>
+
+<h2>设备管理 <small class="hint">ESP32 按 MAC、安卓按 UUID 自动注册;禁用后立即踢下线且无法重连</small></h2>
+<div class="row-form">
+  <input id="newDevId" placeholder="设备 ID / MAC,如 A4:CF:12:..">
+  <input id="newDevName" placeholder="备注名(可选)">
+  <button onclick="addDevice()">新增设备</button>
+</div>
+<table>
+  <thead><tr>
+    <th>设备 ID</th><th>名称</th><th>状态</th><th>已启用</th>
+    <th>所在群组</th><th>当前群组(监听/通讯)</th><th>最后在线</th><th>操作</th>
+  </tr></thead>
+  <tbody id="devRows"></tbody>
+</table>
+
+<h2>群组管理 <small class="hint">设备可加入多个群组;设备端/管理台均可切换"当前群组"</small></h2>
+<div class="row-form">
+  <input id="newGroupName" placeholder="新群组名称">
+  <button onclick="createGroup()">创建群组</button>
+</div>
+<table>
+  <thead><tr>
+    <th>ID</th><th>群组名</th><th>成员</th><th>添加成员</th><th>操作</th>
+  </tr></thead>
+  <tbody id="groupRows"></tbody>
+</table>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let devices = [], groups = [];
+
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.style.display = 'block';
+  clearTimeout(t._h); t._h = setTimeout(() => t.style.display = 'none', 2500);
+}
+
+async function api(method, url, body) {
+  const resp = await fetch(url, {
+    method,
+    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!resp.ok) {
+    let msg = resp.status;
+    try { msg = (await resp.json()).detail || msg; } catch (e) {}
+    throw new Error(msg);
+  }
+  return resp.status === 200 ? resp.json() : null;
+}
+
+async function refresh() {
+  try {
+    const [d, g] = await Promise.all([api('GET', '/api/devices'), api('GET', '/api/groups')]);
+    devices = d.devices; groups = g.groups;
+    render();
+  } catch (e) { toast('刷新失败: ' + e.message); }
+}
+
+function el(tag, attrs, ...children) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === 'text') n.textContent = v;
+    else if (k.startsWith('on')) n.addEventListener(k.slice(2), v);
+    else n.setAttribute(k, v);
+  }
+  children.forEach(c => n.appendChild(c));
+  return n;
+}
+
+function groupName(id) {
+  const g = groups.find(g => g.id === id);
+  return g ? g.name : ('#' + id);
+}
+
+function render() {
+  const online = devices.filter(d => d.online).length;
+  document.getElementById('onlineHint').textContent = `在线 ${online}/${devices.length}`;
+
+  // ---- 设备表 ----
+  const tb = document.getElementById('devRows');
+  tb.textContent = '';
+  for (const d of devices) {
+    const groupCell = el('td');
+    if (d.groups.length === 0) groupCell.textContent = '(未加入)';
+    d.groups.forEach(g => groupCell.appendChild(el('span', { class: 'chip', text: g.name })));
+
+    const activeSel = el('select', {
+      onchange: e => api('PATCH', '/api/devices/' + d.id, { active_group_id: +e.target.value || null })
+        .then(refresh).catch(err => { toast(err.message); refresh(); })
+    });
+    activeSel.appendChild(el('option', { value: '', text: '(无)' }));
+    d.groups.forEach(g => {
+      const o = el('option', { value: g.id, text: g.name });
+      if (g.id === d.active_group_id) o.selected = true;
+      activeSel.appendChild(o);
+    });
+
+    const op = el('td');
+    op.appendChild(el('button', {
+      class: 'mini', text: '改名',
+      onclick: () => { const n = prompt('新名称', d.name); if (n) api('PATCH', '/api/devices/' + d.id, { name: n }).then(refresh).catch(e2 => toast(e2.message)); }
+    }));
+    op.appendChild(el('button', {
+      class: 'mini', text: d.enabled ? '禁用' : '启用',
+      onclick: () => api('PATCH', '/api/devices/' + d.id, { enabled: !d.enabled }).then(refresh).catch(e2 => toast(e2.message))
+    }));
+    op.appendChild(el('button', {
+      class: 'mini', text: '删除',
+      onclick: () => { if (confirm('确定删除设备 ' + d.name + '?')) api('DELETE', '/api/devices/' + d.id).then(refresh).catch(e2 => toast(e2.message)); }
+    }));
+
+    tb.appendChild(el('tr', null,
+      el('td', { text: d.id }),
+      el('td', { text: d.name }),
+      el('td', { text: d.online ? '在线' : '离线', class: d.online ? 'on' : 'off' }),
+      el('td', { text: d.enabled ? '是' : '否', class: d.enabled ? '' : 'dis' }),
+      groupCell,
+      el('td', null, activeSel),
+      el('td', { text: d.last_seen || '-' }),
+      op
+    ));
+  }
+
+  // ---- 群组表 ----
+  const gb = document.getElementById('groupRows');
+  gb.textContent = '';
+  for (const g of groups) {
+    const members = el('td');
+    if (g.members.length === 0) members.textContent = '(空)';
+    for (const m of g.members) {
+      members.appendChild(el('span', { class: 'chip' },
+        document.createTextNode(m.name + ' (' + m.id.slice(-4) + ')'),
+        el('button', { text: '×', title: '移出', onclick: () => api('DELETE', `/api/groups/${g.id}/members/${m.id}`).then(refresh).catch(e2 => toast(e2.message)) })
+      ));
+    }
+
+    const addCell = el('td');
+    const sel = el('select');
+    sel.appendChild(el('option', { value: '', text: '选择设备…' }));
+    devices.forEach(d => sel.appendChild(el('option', { value: d.id, text: d.name + ' (' + d.id.slice(-4) + ')' })));
+    addCell.appendChild(sel);
+    addCell.appendChild(el('button', {
+      class: 'mini', text: '加入',
+      onclick: () => { if (sel.value) api('POST', `/api/groups/${g.id}/members`, { device_id: sel.value }).then(refresh).catch(e2 => toast(e2.message)); else toast('请先选择设备'); }
+    }));
+
+    const op = el('td');
+    op.appendChild(el('button', {
+      class: 'mini', text: '改名',
+      onclick: () => { const n = prompt('新群组名', g.name); if (n) api('PATCH', '/api/groups/' + g.id, { name: n }).then(refresh).catch(e2 => toast(e2.message)); }
+    }));
+    op.appendChild(el('button', {
+      class: 'mini', text: '删除',
+      onclick: () => { if (confirm('删除群组 ' + g.name + '?')) api('DELETE', '/api/groups/' + g.id).then(refresh).catch(e2 => toast(e2.message)); }
+    }));
+
+    gb.appendChild(el('tr', null,
+      el('td', { text: g.id }),
+      el('td', { text: g.name }),
+      members, addCell, op
+    ));
+  }
+}
+
+async function addDevice() {
+  const id = document.getElementById('newDevId').value.trim();
+  const name = document.getElementById('newDevName').value.trim();
+  if (!id) return toast('请输入设备 ID');
+  try { await api('POST', '/api/devices', { id, name }); toast('已添加'); refresh(); }
+  catch (e) { toast(e.message); }
+}
+
+async function createGroup() {
+  const name = document.getElementById('newGroupName').value.trim();
+  if (!name) return toast('请输入群组名');
+  try { await api('POST', '/api/groups', { name }); toast('已创建'); document.getElementById('newGroupName').value = ''; refresh(); }
+  catch (e) { toast(e.message); }
+}
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

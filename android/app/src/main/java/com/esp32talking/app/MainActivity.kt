@@ -2,6 +2,7 @@ package com.esp32talking.app
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioFormat
@@ -13,26 +14,37 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.MotionEvent
+import android.view.View
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
+import org.json.JSONObject
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
+private data class GroupInfo(val id: Int, val name: String)
+
 /**
- * esp32talking 安卓客户端 (M1)
+ * esp32talking 安卓客户端 (M2)
  *
- * 与 ESP32 固件同协议:连接 ws://<服务器>:8000/ws,
- * 按住 PTT 采集 16kHz/16bit/单声道 PCM,20ms 一帧(640 字节)二进制上行;
- * 收到的二进制帧进入播放队列,松开 PTT 后播放(半双工,避免回声啸叫)。
+ * 协议与 ESP32 一致:16kHz/16bit/单声道 PCM,20ms 一帧(640 字节)二进制帧。
+ * - 连接后发送 hello(id=持久化 UUID),服务器回 welcome(设备所在群组列表)
+ * - 可加入多个群组,通过下拉框选择"当前群组"进行监听和通讯(select_group)
+ * - 群组改名:走服务器 REST 接口,成功后刷新群组列表
+ * - 服务器按"当前群组"路由语音;发送方不会听到自己的回声
  */
 class MainActivity : Activity() {
 
@@ -53,6 +65,8 @@ class MainActivity : Activity() {
     private lateinit var etServer: EditText
     private lateinit var btnConnect: Button
     private lateinit var btnPtt: Button
+    private lateinit var spGroup: Spinner
+    private lateinit var btnRenameGroup: Button
 
     private val ui = Handler(Looper.getMainLooper())
     private val http = OkHttpClient.Builder()
@@ -63,6 +77,10 @@ class MainActivity : Activity() {
     private var ws: WebSocket? = null
     private var userClosed = false
     private var reconnectScheduled = false
+
+    private val groups = mutableListOf<GroupInfo>()
+    private var activeGroupId: Int? = null
+    private var spinnerBusy = false
 
     // ---- 采集(按住 PTT 期间) ----
     private val talking = AtomicBoolean(false)
@@ -75,7 +93,7 @@ class MainActivity : Activity() {
     private val playQueue = ArrayDeque<ByteArray>()
     private val playLock = Object()
 
-    /** 设备唯一 ID(安卓拿不到稳定 MAC,用持久化 UUID 代替,M2 注册用) */
+    /** 设备唯一 ID(安卓拿不到稳定 MAC,用持久化 UUID 代替) */
     private fun deviceId(): String {
         val p = getSharedPreferences(PREFS, MODE_PRIVATE)
         p.getString(KEY_DEVICE_ID, null)?.let { return it }
@@ -91,6 +109,8 @@ class MainActivity : Activity() {
         etServer = findViewById(R.id.etServer)
         btnConnect = findViewById(R.id.btnConnect)
         btnPtt = findViewById(R.id.btnPtt)
+        spGroup = findViewById(R.id.spGroup)
+        btnRenameGroup = findViewById(R.id.btnRenameGroup)
 
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         etServer.setText(prefs.getString(KEY_SERVER, DEFAULT_SERVER))
@@ -98,6 +118,22 @@ class MainActivity : Activity() {
         btnConnect.setOnClickListener {
             if (ws == null) connect() else disconnect()
         }
+
+        spGroup.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                if (spinnerBusy) return
+                val g = groups.getOrNull(position) ?: return
+                if (g.id != activeGroupId) {
+                    activeGroupId = g.id
+                    ws?.send("{\"type\":\"select_group\",\"group_id\":${g.id}}")
+                    toast("当前群组: ${g.name}")
+                }
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+
+        btnRenameGroup.setOnClickListener { showRenameDialog() }
 
         btnPtt.setOnTouchListener { _, e ->
             when (e.action) {
@@ -144,7 +180,7 @@ class MainActivity : Activity() {
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                Log.d(TAG, "文本: $text")
+                handleServerText(text)
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: okhttp3.Response?) {
@@ -164,6 +200,7 @@ class MainActivity : Activity() {
         ws?.close(1000, "bye")
         ws = null
         btnConnect.text = "连接服务器"
+        updateGroups(emptyList(), null)
         setStatus("未连接")
     }
 
@@ -172,6 +209,7 @@ class MainActivity : Activity() {
         stopTalking()
         ui.post {
             btnConnect.text = "连接服务器"
+            updateGroups(emptyList(), null)
             if (!userClosed) {
                 setStatus("$msg,5 秒后重连")
                 if (!reconnectScheduled) {
@@ -182,6 +220,93 @@ class MainActivity : Activity() {
                 setStatus("未连接")
             }
         }
+    }
+
+    /** 处理服务器下发的文本(JSON)消息 */
+    private fun handleServerText(text: String) {
+        val obj = runCatching { JSONObject(text) }.getOrNull() ?: return
+        when (obj.optString("type")) {
+            "welcome", "groups" -> {
+                val arr = obj.optJSONArray("groups") ?: return
+                val list = mutableListOf<GroupInfo>()
+                for (i in 0 until arr.length()) {
+                    val g = arr.getJSONObject(i)
+                    list.add(GroupInfo(g.getInt("id"), g.getString("name")))
+                }
+                val active =
+                    if (obj.has("active_group_id") && !obj.isNull("active_group_id"))
+                        obj.getInt("active_group_id") else null
+                ui.post { updateGroups(list, active) }
+            }
+            "rejected" -> {
+                val reason = obj.optString("reason", "被拒绝")
+                ui.post { toast("服务器拒绝: $reason") }
+            }
+        }
+    }
+
+    /** 刷新群组下拉框;active 为服务器指定的当前群组 */
+    private fun updateGroups(list: List<GroupInfo>, active: Int?) {
+        groups.clear()
+        groups.addAll(list)
+        spinnerBusy = true
+        val names =
+            if (groups.isEmpty()) mutableListOf("(未加入群组)")
+            else groups.map { it.name }.toMutableList()
+        spGroup.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, names)
+        val idx = active?.let { a -> groups.indexOfFirst { it.id == a } }
+            ?.takeIf { it >= 0 } ?: 0
+        if (groups.isNotEmpty()) spGroup.setSelection(idx, false)
+        activeGroupId = groups.getOrNull(idx)?.id
+        spinnerBusy = false
+    }
+
+    private fun showRenameDialog() {
+        val g = groups.getOrNull(spGroup.selectedItemPosition)
+        if (g == null) {
+            toast("没有可改名的群组")
+            return
+        }
+        val input = EditText(this)
+        input.setText(g.name)
+        AlertDialog.Builder(this)
+            .setTitle("重命名群组「${g.name}」")
+            .setView(input)
+            .setPositiveButton("确定") { _, _ ->
+                val newName = input.text.toString().trim()
+                if (newName.isNotEmpty() && newName != g.name) renameGroup(g.id, newName)
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /** 通过 REST 接口改群组名,成功后请求服务器刷新群组列表 */
+    private fun renameGroup(groupId: Int, newName: String) {
+        val base = etServer.text.toString().trim()
+            .replaceFirst("ws://", "http://")
+            .replaceFirst("wss://", "https://")
+            .removeSuffix("/ws")
+        Thread {
+            try {
+                val body = JSONObject().put("name", newName).toString()
+                    .toRequestBody("application/json".toMediaType())
+                val req = Request.Builder()
+                    .url("$base/api/groups/$groupId")
+                    .patch(body)
+                    .build()
+                http.newCall(req).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        ws?.send("{\"type\":\"list_groups\"}")
+                        ui.post { toast("已重命名") }
+                    } else {
+                        ui.post { toast("重命名失败: HTTP ${resp.code}") }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "rename failed", e)
+                ui.post { toast("重命名失败: ${e.message}") }
+            }
+        }.start()
     }
 
     private fun setStatus(s: String) = ui.post { tvStatus.text = s }
@@ -195,6 +320,10 @@ class MainActivity : Activity() {
         if (talking.get()) return
         if (ws == null) {
             toast("请先连接服务器")
+            return
+        }
+        if (activeGroupId == null) {
+            toast("未加入任何群组,请先在管理台加入群组")
             return
         }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
@@ -258,10 +387,11 @@ class MainActivity : Activity() {
         val minBuf = AudioTrack.getMinBufferSize(
             SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
         )
+        // USAGE_MEDIA 保证走扬声器外放(VOICE_COMMUNICATION 可能路由到听筒导致音量小)
         val t = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build()
             )

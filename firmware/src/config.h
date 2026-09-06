@@ -20,9 +20,10 @@
 #define FRAME_SAMPLES  (SAMPLE_RATE * FRAME_MS / 1000)  // 320 采样/帧
 #define FRAME_BYTES    (FRAME_SAMPLES * 2)              // 640 字节 PCM16/帧
 
-// 麦克风增益:右移位数。16=原增益,数值越小越响(12=约+24dB),
-// 嫌声音小就调小,爆音就调大。
-#define MIC_GAIN_SHIFT 14
+// 麦克风增益:右移位数。16=0dB,14=+12dB,12=+24dB,数值越小越响。
+// 默认 12(上一版 14 偏小)。若爆音改回 13/14;若仍偏小可试 11。
+// 硬件上也可把 MAX98357A 的 GAIN 引脚接 GND(输出再 +3dB)。
+#define MIC_GAIN_SHIFT 12
 
 // ==== INMP441 麦克风 (I2S0 接收) ====
 // VDD->3.3V  GND->GND  L/R->GND
