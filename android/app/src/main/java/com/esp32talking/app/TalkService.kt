@@ -534,6 +534,7 @@ class TalkService : Service() {
         activeGroupId = active ?: list.firstOrNull()?.id
         val snapshot = list.toList()
         listeners.forEach { it.onGroups(snapshot, activeGroupId) }
+        updateNotification()
     }
 
     // ---------------- PTT 话权 ----------------
@@ -802,19 +803,38 @@ class TalkService : Service() {
     }
 
     private fun startForegroundNow() {
+        startForeground(NOTIF_ID, buildNotification())
+        foreground = true
+    }
+
+    /** 状态/群组变化后刷新常驻通知 */
+    private fun updateNotification() {
+        if (!foreground) return
+        try {
+            getSystemService(NotificationManager::class.java)
+                .notify(NOTIF_ID, buildNotification())
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun buildNotification(): Notification {
         val pi = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE
         )
-        val notif = Notification.Builder(this, CHANNEL_ID)
+        val groupName = groups.firstOrNull { it.id == activeGroupId }?.name
+        val text = when {
+            ws != null && groupName != null -> "已连接 · 当前群组:$groupName"
+            statusText.isNotEmpty() -> statusText
+            else -> "保持连接中"
+        }
+        return Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("esp32talking 对讲机")
-            .setContentText(statusText.ifEmpty { "保持连接中" })
+            .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentIntent(pi)
             .setOngoing(true)
             .build()
-        startForeground(NOTIF_ID, notif)
-        foreground = true
     }
 
     private fun stopForegroundAndNotification() {
@@ -849,6 +869,7 @@ class TalkService : Service() {
     private fun setStatus(s: String) {
         statusText = s
         listeners.forEach { it.onStatus(s) }
+        updateNotification()
     }
 
     private fun notifyError(msg: String) {
