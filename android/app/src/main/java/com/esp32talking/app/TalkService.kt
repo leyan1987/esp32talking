@@ -49,6 +49,7 @@ class TalkService : Service() {
         private const val NOTIF_ID = 1
         private const val PREFS = "cfg"
         private const val KEY_SERVER = "server"
+        private const val KEY_RECOVERY = "recovery_code"
         private const val SAMPLE_RATE = 16000
         private const val FRAME_SAMPLES = 320          // 20ms
         private const val FRAME_BYTES = FRAME_SAMPLES * 2
@@ -181,6 +182,23 @@ class TalkService : Service() {
 
     fun currentUrl(): String? = serverUrl
 
+    /** 当前恢复码(来自服务器下发或用户手动恢复) */
+    fun currentRecovery(): String =
+        getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_RECOVERY, "") ?: ""
+
+    /**
+     * 用旧恢复码恢复身份:保存后断开并以新身份重连,
+     * 服务器凭恢复码找回原设备,welcome 自动下发历史群组。
+     */
+    fun restoreWithCode(code: String) {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_RECOVERY, code).apply()
+        val url = serverUrl
+        disconnect()
+        if (url != null) {
+            ui.post { connect(url) }
+        }
+    }
+
     fun disconnect() {
         userClosed = true
         stopTalkingInternal()
@@ -258,16 +276,20 @@ class TalkService : Service() {
 
         val request = Request.Builder().url(url).build()
         ws = http.newWebSocket(request, object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: okhttp3.Response) {
-                val id = deviceId()
-                val hello = JSONObject()
-                    .put("type", "hello")
-                    .put("id", id)
-                    .put("kind", "android")
-                    .put("proto", 1)
-                webSocket.send(hello.toString())
-                setStatus("已连接: $url")
-            }
+        override fun onOpen(webSocket: WebSocket, response: okhttp3.Response) {
+            val id = deviceId()
+            val hello = JSONObject()
+                .put("type", "hello")
+                .put("id", id)
+                .put("kind", "android")
+                .put("proto", 1)
+            // 重装后凭恢复码找回原设备身份(服务器据此下发历史群组)
+            getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_RECOVERY, null)
+                ?.takeIf { it.matches(Regex("\\d{10}")) }
+                ?.let { hello.put("recovery", it) }
+            webSocket.send(hello.toString())
+            setStatus("已连接: $url")
+        }
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
                 enqueuePlay(bytes.toByteArray())
@@ -317,6 +339,13 @@ class TalkService : Service() {
                 obj.optJSONObject("device")?.optString("name")?.let {
                     if (it.isNotEmpty()) myDeviceName = it
                 }
+                // 保存服务器下发的恢复码(权威值),重装后凭它找回身份
+                obj.optJSONObject("device")?.optString("recovery_code")
+                    ?.takeIf { it.matches(Regex("\\d{10}")) }
+                    ?.let {
+                        getSharedPreferences(PREFS, MODE_PRIVATE)
+                            .edit().putString(KEY_RECOVERY, it).apply()
+                    }
                 val arr = obj.optJSONArray("groups") ?: return
                 val list = mutableListOf<GroupInfo>()
                 for (i in 0 until arr.length()) {

@@ -89,10 +89,13 @@ async def expect_silence(ws, timeout=0.7):
         pass
 
 
-async def hello_device(ws, dev_id: str, kind: str = "esp32", join_code: str | None = None) -> dict:
+async def hello_device(ws, dev_id: str, kind: str = "esp32", join_code: str | None = None,
+                       recovery: str | None = None) -> dict:
     msg = {"type": "hello", "id": dev_id, "kind": kind}
     if join_code:
         msg["join_code"] = join_code
+    if recovery:
+        msg["recovery"] = recovery
     await ws.send(json.dumps(msg))
     return await recv_json(ws)
 
@@ -132,7 +135,23 @@ async def main() -> int:
         welcome = await hello_device(w1, D1)
         assert welcome["type"] == "welcome", welcome
         assert welcome["device"]["id"] == D1 and welcome["groups"] == []
-        print("1. 自动注册 + welcome(空群组) OK")
+        r1 = welcome["device"]["recovery_code"]
+        assert isinstance(r1, str) and len(r1) == 10 and r1.isdigit(), welcome
+        print("1. 自动注册 + welcome(空群组/恢复码下发) OK")
+
+    # 1b) 模拟重装:换了新 id,凭旧恢复码找回原身份
+    async with websockets.connect(URI) as w1b:
+        wl = await hello_device(w1b, "TEST-REINSTALL-1", recovery=r1)
+        assert wl["device"]["id"] == D1, wl
+        assert wl["device"]["recovery_code"] == r1, wl
+        print("1b. 凭恢复码找回设备身份 OK")
+
+    # 1c) 新设备自带恢复码注册(用户自选码)
+    async with websockets.connect(URI) as w1c:
+        wl = await hello_device(w1c, "TEST-SELF-0001", recovery="9999999999")
+        assert wl["device"]["id"] == "TEST-SELF-0001", wl
+        assert wl["device"]["recovery_code"] == "9999999999", wl
+        print("1c. 客户端自选恢复码注册 OK")
 
         # 2) REST 建群(6 位群号)、手工新增设备、拉成员、改名
         g1 = api("POST", "/groups", {"name": "车队"})

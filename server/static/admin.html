@@ -220,8 +220,15 @@ function render() {
       onclick: () => { if (confirm('确定删除设备 ' + d.name + '?')) api('DELETE', '/api/devices/' + d.id).then(refresh).catch(e2 => toast(e2.message)); }
     }));
 
+    const idCell = el('td');
+    idCell.appendChild(el('div', { text: d.id }));
+    idCell.appendChild(el('div', {
+      text: '恢复码 ' + (d.recovery_code || '(连接后下发)'),
+      style: 'color:#888;font-size:11px;'
+    }));
+
     tb.appendChild(el('tr', null,
-      el('td', { text: d.id }),
+      idCell,
       el('td', { text: d.name }),
       el('td', { text: d.online ? '在线' : '离线', class: d.online ? 'on' : 'off' }),
       el('td', { text: d.enabled ? '是' : '否', class: d.enabled ? '' : 'dis' }),

@@ -53,6 +53,7 @@ class MainActivity : Activity() {
     private lateinit var tvMyName: TextView
     private lateinit var btnMyName: Button
     private lateinit var btnGain: Button
+    private lateinit var btnDevCode: Button
     private lateinit var etServer: EditText
     private lateinit var btnConnect: Button
     private lateinit var btnPtt: Button
@@ -142,6 +143,7 @@ class MainActivity : Activity() {
         tvMyName = findViewById(R.id.tvMyName)
         btnMyName = findViewById(R.id.btnMyName)
         btnGain = findViewById(R.id.btnGain)
+        btnDevCode = findViewById(R.id.btnDevCode)
         etServer = findViewById(R.id.etServer)
         btnConnect = findViewById(R.id.btnConnect)
         btnPtt = findViewById(R.id.btnPtt)
@@ -199,6 +201,9 @@ class MainActivity : Activity() {
             val idx = svc?.cycleGain() ?: return@setOnClickListener
             btnGain.text = "音量x${idx + 1}"
             toast(if (idx == 0) "已恢复原始音量" else "播放音量增强 x${idx + 1}(在服务里对 PCM 放大)")
+        }
+        btnDevCode.setOnClickListener {
+            showDeviceCodeDialog()
         }
 
         btnPtt.setOnTouchListener { _, e ->
@@ -296,6 +301,67 @@ class MainActivity : Activity() {
             floorHolder != null && floorHolder != myName -> "等候:$floorHolder 讲话中"
             else -> "按住 说话"
         }
+    }
+
+    /** 设备恢复码:查看当前码 / 重装后凭旧码找回设备身份与历史群组 */
+    private fun showDeviceCodeDialog() {
+        val code = svc?.currentRecovery() ?: ""
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(16), dp(24), dp(8))
+        }
+
+        val codeView = TextView(this).apply {
+            text = if (code.isEmpty()) "(尚未获取,连接服务器后自动下发)" else code
+            textSize = 26f
+            setPadding(0, dp(4), 0, dp(4))
+        }
+        container.addView(codeView)
+
+        container.addView(
+            TextView(this).apply {
+                text = "重装 App 后如群组丢失:先记下此码(截图或抄写,管理台也能查),重装后在此输入旧码即可找回原设备与全部历史群组。\n点击号码可复制。"
+                textSize = 13f
+                setPadding(0, dp(8), 0, dp(8))
+            }
+        )
+
+        val input = EditText(this)
+        input.hint = "输入旧恢复码(10 位数字)"
+        input.inputType = android.text.InputType.TYPE_CLASS_NUMBER
+        container.addView(input)
+
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("设备恢复码")
+            .setView(container)
+            .setPositiveButton("恢复该码", null)   // 下面覆盖,避免空输入也关闭
+            .setNeutralButton("复制当前码") { _, _ ->
+                if (code.isNotEmpty()) {
+                    val cm = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                    cm.setPrimaryClip(android.content.ClipData.newPlainText("recovery", code))
+                    toast("已复制")
+                }
+            }
+            .setNegativeButton("关闭", null)
+            .create()
+
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val c = input.text.toString().trim()
+                if (c.matches(Regex("\\d{10}"))) {
+                    if (c == code) {
+                        toast("与当前恢复码相同")
+                    } else {
+                        dialog.dismiss()
+                        svc?.restoreWithCode(c)
+                        toast("正在以恢复码重新连接…")
+                    }
+                } else {
+                    toast("请输入 10 位数字恢复码")
+                }
+            }
+        }
+        dialog.show()
     }
 
     /** 修改自己的昵称 */

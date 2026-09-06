@@ -93,6 +93,12 @@ try:
     db.commit()
 except sqlite3.OperationalError:
     pass  # 列已存在
+# 旧库升级:devices 补 recovery_code 列(恢复码)
+try:
+    db.execute("ALTER TABLE devices ADD COLUMN recovery_code TEXT")
+    db.commit()
+except sqlite3.OperationalError:
+    pass  # 列已存在
 
 
 def now() -> str:
@@ -250,16 +256,59 @@ async def ws_endpoint(ws: WebSocket) -> None:
             await ws.close(code=1002)
             return
 
-        # ---- 设备注册校验(未知设备自动注册) ----
+        # ---- 设备恢复码(M2.4):重装 App 后凭 10 位恢复码找回原设备身份 ----
+        rec = str(hello.get("recovery") or "").strip()
+        if not (rec.isdigit() and len(rec) == 10):
+            rec = ""
+
+        def gen_recovery() -> str:
+            while True:
+                code = "".join(random.choice("0123456789") for _ in range(10))
+                if db.execute(
+                    "SELECT 1 FROM devices WHERE recovery_code = ?", (code,)
+                ).fetchone() is None:
+                    return code
+
         dev = db.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
+        if dev is None and rec:
+            # 上报的 id 未注册,但恢复码能对上已有设备 -> 找回身份(历史群组随 welcome 下发)
+            dev = db.execute(
+                "SELECT * FROM devices WHERE recovery_code = ?", (rec,)
+            ).fetchone()
+            if dev is not None:
+                log.info("设备凭恢复码找回身份: %s (上报 id %s)", dev["id"], device_id)
         if dev is None:
             db.execute(
-                "INSERT INTO devices(id, name, last_seen) VALUES(?, ?, ?)",
-                (device_id, f"设备-{device_id[-4:]}", now()),
+                "INSERT INTO devices(id, name, recovery_code, last_seen) VALUES(?, ?, ?, ?)",
+                (device_id, f"设备-{device_id[-4:]}", rec or gen_recovery(), now()),
             )
             db.commit()
             dev = db.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
             log.info("新设备自动注册: %s (%s)", device_id, hello.get("kind", "?"))
+        else:
+            if dev["recovery_code"] is None:
+                code = gen_recovery()
+                db.execute(
+                    "UPDATE devices SET recovery_code = ? WHERE id = ?", (code, dev["id"])
+                )
+                db.commit()
+                dev = db.execute("SELECT * FROM devices WHERE id = ?", (dev["id"],)).fetchone()
+            elif rec and rec != dev["recovery_code"]:
+                # 客户端上报了不同的恢复码:未被其他设备占用则采用(客户端为准)
+                taken = db.execute(
+                    "SELECT id FROM devices WHERE recovery_code = ? AND id != ?",
+                    (rec, dev["id"]),
+                ).fetchone()
+                if taken is None:
+                    db.execute(
+                        "UPDATE devices SET recovery_code = ? WHERE id = ?", (rec, dev["id"])
+                    )
+                    db.commit()
+                    dev = db.execute(
+                        "SELECT * FROM devices WHERE id = ?", (dev["id"],)
+                    ).fetchone()
+                    log.info("设备 %s 更新恢复码", dev["id"])
+        device_id = dev["id"]  # 恢复身份后以服务器记录为准
         if not dev["enabled"]:
             await ws.send_text(
                 json.dumps({"type": "rejected", "reason": "设备已被禁用"}, ensure_ascii=False)
@@ -304,7 +353,11 @@ async def ws_endpoint(ws: WebSocket) -> None:
             conn,
             {
                 "type": "welcome",
-                "device": {"id": device_id, "name": dev["name"]},
+                "device": {
+                    "id": device_id,
+                    "name": dev["name"],
+                    "recovery_code": dev["recovery_code"],
+                },
                 "groups": group_rows(device_id),
                 "active_group_id": conn.active_group_id,
             },
@@ -529,6 +582,7 @@ def device_payload(r: sqlite3.Row) -> dict:
         "name": r["name"],
         "enabled": bool(r["enabled"]),
         "priority": r["priority"],
+        "recovery_code": r["recovery_code"],
         "online": r["id"] in conn_by_device,
         "active_group_id": r["active_group_id"],
         "last_seen": r["last_seen"],

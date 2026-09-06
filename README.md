@@ -19,7 +19,8 @@
 - ✅ 安卓端:新建群组 / 群号加入 / 切换当前群组 / 群组改名 / 群成员在线状态 / 自改昵称 / 话权等待与抢占提示
 - ✅ **ADPCM 压缩(M3)**:IMA ADPCM 4:1,上行/下行带宽 32KB/s → **8KB/s**;帧头自带解码状态,丢帧不扩散;接收端按帧长自动识别新(ADPCM 164 字节)/旧(PCM 640 字节)格式;ESP32 播放缓冲等效时长 ×4(约 8 秒);语音 SNR 实测约 30dB
 - ✅ 安卓保活:前台服务 + CPU/WiFi 锁,灭屏、划掉 App 后仍保持在线
-- ✅ 设备身份:安卓用 ANDROID_ID 派生稳定 ID,重装 App 不丢群组
+- ✅ 设备身份与恢复码:每台设备有 **10 位恢复码**(连接后自动下发,管理台可查);安卓重装 App 后点【设备码】输入旧码即可找回原设备和全部历史群组;ANDROID_ID 稳定的手机重装后自动恢复
+- ⏳ M4(可选):多群组提示音、管理台美化、设备离线告警、WSS 加密
 
 ## 快速开始
 
@@ -74,14 +75,20 @@ python -m venv .venv
 
 ### 数据存在哪里
 
-- **所有数据(设备、群组、成员关系、昵称)都在服务器的 `server/esp32talking.db`**(SQLite 单文件),备份这个文件即可;删除它等于全部重置
-- 手机端不保存群组;设备身份用 ANDROID_ID 派生(恢复出厂设置或更换签名才会改变),卸载重装 App 后重连即恢复原有群组
+- **所有数据(设备、群组、成员关系、昵称、恢复码)都在服务器的 `server/esp32talking.db`**(SQLite 单文件),备份这个文件即可;删除它等于全部重置
+- 手机端不保存群组;设备身份由服务器分配 **10 位恢复码**并在连接时下发保存
+
+### 重装 App 后恢复群组(恢复码)
+
+1. 平时:App 里点【设备码】可见当前恢复码,截图/抄写保存(管理台设备列表也可查)
+2. 重装后:连上服务器 → 点【设备码】→ 输入旧恢复码 → 自动重连,服务器找回原设备,welcome 自动下发全部历史群组
+3. 若手机 ANDROID_ID 稳定(多数原生系统),重装后身份自动一致,无需手动输入
 
 > 注:安卓 6+ 拿不到稳定 WiFi MAC,客户端用持久化 UUID 作为设备 ID;管理台里可为其改名区分。
 
 ## 协议速查(WebSocket)
 
-- 文本帧 JSON:`hello{id,kind,join_code?}` → `welcome{device,groups,active_group_id}`(join_code 存在时自动入群);`create_group{name}` → `created{group_id,name}` + `groups{...}`;`join_group{code}` → `groups{...}`(群号错误回 `error`);`select_group{group_id}`、`list_groups` → `groups{...}`;`set_name{name}` → `device_info`;`rename_group{group_id,name}`(仅限自己所在群组)、`list_members{group_id}` → `members{...}`;被禁用收 `rejected{reason}` 后被断开
+- 文本帧 JSON:`hello{id,kind,join_code?,recovery?}` → `welcome{device:{id,name,recovery_code},groups,active_group_id}`(recovery 能对上已有设备时找回身份;join_code 存在时自动入群);`create_group{name}` → `created{group_id,name}` + `groups{...}`;`join_group{code}` → `groups{...}`(群号错误回 `error`);`select_group{group_id}`、`list_groups` → `groups{...}`;`set_name{name}` → `device_info`;`rename_group{group_id,name}`(仅限自己所在群组)、`list_members{group_id}` → `members{...}`;被禁用收 `rejected{reason}` 后被断开
 - **话权(M3)**:`ptt_request` → `ptt_grant` 或 `ptt_deny{holder_name}`;`ptt_release` 释放;被抢占收 `ptt_revoke`;群内广播 `ptt_status{held,holder_name}`;未持话权的音频帧被服务器丢弃
 - 二进制帧:**ADPCM 164 字节**(M3,4 字节状态头 + 160 字节数据)或裸 PCM 640 字节(旧客户端兼容),接收端按帧长自动识别;服务器按发送方"当前群组"原样转发给同组其他在线成员,不回发给发送方
 
