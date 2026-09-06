@@ -446,6 +446,12 @@ async def handle_text(conn: Conn, text: str) -> None:
             await send_chat_history(conn, gid)  # 切群后补发该群离线消息
             log.info("设备 %s 切换群组 -> %d", conn.device_id, gid)
 
+    elif t == "chat_history":
+        # 客户端按需拉取群历史(界面重新打开时)
+        gid = obj.get("group_id")
+        if isinstance(gid, int) and gid in conn.member_groups:
+            await send_chat_history(conn, gid)
+
     elif t == "chat":
         # 文字消息:发到当前群组,持久化,在线成员实时收,离线成员上线补发
         text = str(obj.get("text", "")).strip()[:200]

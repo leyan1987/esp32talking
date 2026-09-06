@@ -273,9 +273,14 @@ async def main() -> int:
         # 空文本被忽略
         await w1.send(json.dumps({"type": "chat", "text": "   "}))
         await expect_silence(w1)
+        # 6c) 按需拉取历史(界面重新打开的场景)
+        await w1.send(json.dumps({"type": "chat_history", "group_id": g1["id"]}))
+        hist2 = await recv_of_type(w1, "chat_history")
+        assert hist2["group_id"] == g1["id"] and len(hist2["messages"]) >= 1, hist2
         await drain(w1)
         await drain(w2)
         print("6b. 文字消息(群发/离线补发/空文本忽略) OK")
+        print("6c. 按需拉取聊天历史 OK")
 
         # 7) REST 群组改名推送(管理台方式)
         api("PATCH", f"/groups/{g1['id']}", {"name": "车队A组"})

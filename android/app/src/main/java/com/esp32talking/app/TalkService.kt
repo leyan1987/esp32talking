@@ -197,6 +197,16 @@ class TalkService : Service() {
         gainIdx = getSharedPreferences(PREFS, MODE_PRIVATE).getInt(KEY_GAIN, 0)
             .coerceIn(0, GAIN_STEPS.size - 1)
         startPlayer()
+
+        // 自愈:进程被系统杀掉后重启(或服务重建)时,凭保存的地址自动重连
+        val saved = getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_SERVER, null)
+        if (saved != null && ws == null) {
+            try {
+                connect(saved)
+            } catch (e: Exception) {
+                Log.w(TAG, "auto connect failed", e)
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -230,6 +240,13 @@ class TalkService : Service() {
             l.onDeviceInfo(myDeviceName ?: "")
             l.onGroups(groups.toList(), activeGroupId)
             l.onTalkingChanged(talking.get())
+            // 界面重建时消息区是空的:向服务器按需拉取当前群组历史
+            val gid = activeGroupId
+            if (ws != null && gid != null) {
+                ws?.send(
+                    JSONObject().put("type", "chat_history").put("group_id", gid).toString()
+                )
+            }
         }
     }
 
