@@ -252,6 +252,31 @@ async def main() -> int:
         assert any(g["id"] == g2["id"] for g in gpush["groups"]), gpush
         print("6. WS 凭群号加入 OK(含错误群号提示)")
 
+        # 6b) 文字消息:群发到当前群组;离线设备上线后补发
+        await w1.send(json.dumps({"type": "select_group", "group_id": g1["id"]}))
+        await recv_of_type(w1, "groups")
+        await w2.send(json.dumps({"type": "select_group", "group_id": g1["id"]}))
+        await recv_of_type(w2, "groups")
+        await w2.close()  # D2 离线
+        await asyncio.sleep(0.2)
+        await w1.send(json.dumps({"type": "chat", "text": "大家好,今晚集合"}))
+        got = await recv_of_type(w1, "chat")  # 发送者也会收到(统一顺序)
+        assert got["from_name"] == "ESP32-客厅" and got["text"] == "大家好,今晚集合", got
+        async with websockets.connect(URI) as w2b:
+            await hello_device(w2b, D2)  # D2 的当前群组仍是"车队"
+            hist = await recv_of_type(w2b, "chat_history")
+            assert hist["group_id"] == g1["id"], hist
+            assert any(
+                m["text"] == "大家好,今晚集合" and m["from_name"] == "ESP32-客厅"
+                for m in hist["messages"]
+            ), hist
+        # 空文本被忽略
+        await w1.send(json.dumps({"type": "chat", "text": "   "}))
+        await expect_silence(w1)
+        await drain(w1)
+        await drain(w2)
+        print("6b. 文字消息(群发/离线补发/空文本忽略) OK")
+
         # 7) REST 群组改名推送(管理台方式)
         api("PATCH", f"/groups/{g1['id']}", {"name": "车队A组"})
         pushed = await recv_of_type(w1, "groups")

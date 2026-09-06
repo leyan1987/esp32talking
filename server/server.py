@@ -24,6 +24,10 @@
   S->C  {"type":"error","message":".."}
   S->C  {"type":"rejected","reason":".."}        随后断开(设备被禁用)
   S->C  {"type":"ack","echo":".."}               M1 兼容应答
+  C->S  {"type":"chat","text":".."}              文字消息发到当前群组(<=200字)
+  S->C  {"type":"chat","group_id":N,"from_name":"..","text":"..","ts":".."}
+  S->C  {"type":"chat_history","group_id":N,"messages":[..]}
+                                                 welcome/切群时补发离线消息(每群留50条)
 
 自环开关:默认不再把音频回发给发送方(真实对讲行为)。
 单机自测时启动:  ESP32TALKING_ECHO=1 python server.py (Linux/macOS)
@@ -82,6 +86,14 @@ db.executescript(
     CREATE TABLE IF NOT EXISTS settings(
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS messages(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        group_id INTEGER NOT NULL,
+        from_id TEXT NOT NULL,
+        from_name TEXT NOT NULL,
+        text TEXT NOT NULL,
+        ts TEXT NOT NULL
     );
     """
 )
@@ -151,6 +163,27 @@ async def broadcast_floor(gid: int) -> None:
     for conn in list(conns.values()):
         if gid in conn.member_groups and conn.active_group_id == gid:
             await ws_send_json(conn, msg)
+
+
+# ---------------- 文字消息 ----------------
+
+CHAT_KEEP = 50          # 每群组保留条数
+CHAT_HISTORY_SEND = 30  # 上线/切群时补发条数
+
+
+async def send_chat_history(conn: "Conn", gid: int) -> None:
+    rows = db.execute(
+        "SELECT from_name, text, ts FROM messages WHERE group_id = ? "
+        "ORDER BY id DESC LIMIT ?",
+        (gid, CHAT_HISTORY_SEND),
+    ).fetchall()
+    await ws_send_json(conn, {
+        "type": "chat_history", "group_id": gid,
+        "messages": [
+            {"from_name": r["from_name"], "text": r["text"], "ts": r["ts"]}
+            for r in reversed(rows)
+        ],
+    })
 
 
 def allocate_group_id() -> int:
@@ -362,6 +395,9 @@ async def ws_endpoint(ws: WebSocket) -> None:
                 "active_group_id": conn.active_group_id,
             },
         )
+        # 上线补发当前群组的离线文字消息
+        if conn.active_group_id is not None:
+            await send_chat_history(conn, conn.active_group_id)
         log.info(
             "设备上线: %s (%s) 当前群组 %s, 在线 %d",
             device_id, dev["name"], conn.active_group_id, len(conns),
@@ -407,7 +443,34 @@ async def handle_text(conn: Conn, text: str) -> None:
             )
             db.commit()
             await push_groups(conn)
+            await send_chat_history(conn, gid)  # 切群后补发该群离线消息
             log.info("设备 %s 切换群组 -> %d", conn.device_id, gid)
+
+    elif t == "chat":
+        # 文字消息:发到当前群组,持久化,在线成员实时收,离线成员上线补发
+        text = str(obj.get("text", "")).strip()[:200]
+        gid = conn.active_group_id
+        if not text or gid is None or gid not in conn.member_groups:
+            return
+        from_name = device_name(conn.device_id)
+        ts = now()
+        db.execute(
+            "INSERT INTO messages(group_id, from_id, from_name, text, ts) VALUES(?,?,?,?,?)",
+            (gid, conn.device_id, from_name, text, ts),
+        )
+        db.execute(
+            "DELETE FROM messages WHERE group_id = ? AND id NOT IN "
+            "(SELECT id FROM messages WHERE group_id = ? ORDER BY id DESC LIMIT ?)",
+            (gid, gid, CHAT_KEEP),
+        )
+        db.commit()
+        msg = {
+            "type": "chat", "group_id": gid, "from_id": conn.device_id,
+            "from_name": from_name, "text": text, "ts": ts,
+        }
+        for c in list(conns.values()):
+            if gid in c.member_groups and c.active_group_id == gid:
+                await ws_send_json(c, msg)
 
     elif t == "create_group":
         # 安卓端"新建群组":创建后创建者自动加入并切换为当前群组

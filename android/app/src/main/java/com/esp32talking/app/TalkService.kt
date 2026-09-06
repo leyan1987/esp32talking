@@ -34,6 +34,59 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
+ * 恢复码文件持久化:写入公共 Downloads(MediaStore),
+ * 卸载重装后仍可读取,启动时自动找回设备身份。
+ * Android 10+ 无需任何权限;更老系统静默跳过(退回恢复码手动输入)。
+ */
+private object RecoveryStore {
+    private const val FILE_NAME = "esp32talking_device_code.txt"
+
+    fun load(ctx: android.content.Context): String? = try {
+        if (android.os.Build.VERSION.SDK_INT >= 29) {
+            val resolver = ctx.contentResolver
+            val uri = android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI
+            resolver.query(
+                uri, arrayOf(android.provider.MediaStore.MediaColumns._ID),
+                "${android.provider.MediaStore.MediaColumns.DISPLAY_NAME}=?",
+                arrayOf(FILE_NAME), null
+            )?.use { c ->
+                if (c.moveToFirst()) {
+                    val fileUri = android.content.ContentUris.withAppendedId(uri, c.getLong(0))
+                    resolver.openInputStream(fileUri)?.use {
+                        it.readBytes().decodeToString().trim()
+                    }
+                } else null
+            }
+        } else null
+    } catch (_: Exception) {
+        null
+    }
+
+    fun save(ctx: android.content.Context, code: String) {
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= 29) {
+                val resolver = ctx.contentResolver
+                val uri = android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI
+                resolver.delete(
+                    uri,
+                    "${android.provider.MediaStore.MediaColumns.DISPLAY_NAME}=?",
+                    arrayOf(FILE_NAME)
+                )
+                val values = android.content.ContentValues().apply {
+                    put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, FILE_NAME)
+                    put(android.provider.MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+                    put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, "Download/")
+                }
+                resolver.insert(uri, values)?.let { fileUri ->
+                    resolver.openOutputStream(fileUri)?.use { it.write(code.toByteArray()) }
+                }
+            }
+        } catch (_: Exception) {
+        }
+    }
+}
+
+/**
  * 对讲机前台服务:持有 WebSocket 长连接与音频线程。
  *
  * 灭屏后安卓会休眠 CPU/WiFi 并冻结后台应用导致掉线,因此:
@@ -81,6 +134,12 @@ class TalkService : Service() {
 
         /** list_members 查询结果 */
         fun onMembers(groupId: Int, members: List<MemberInfo>)
+
+        /** 收到一条文字消息 */
+        fun onChat(fromName: String, text: String, ts: String)
+
+        /** 群文字消息历史(welcome/切群补发),旧→新 */
+        fun onChatHistory(groupId: Int, messages: List<ChatMsg>)
     }
 
     inner class LocalBinder : Binder() {
@@ -192,6 +251,7 @@ class TalkService : Service() {
      */
     fun restoreWithCode(code: String) {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_RECOVERY, code).apply()
+        Thread { RecoveryStore.save(this@TalkService, code) }.start()
         val url = serverUrl
         disconnect()
         if (url != null) {
@@ -264,6 +324,19 @@ class TalkService : Service() {
         ws?.send(JSONObject().put("type", "list_members").put("group_id", groupId).toString())
     }
 
+    /** 发送文字消息到当前群组 */
+    fun sendChat(text: String) {
+        if (ws == null) {
+            notifyError("请先连接服务器")
+            return
+        }
+        if (activeGroupId == null) {
+            notifyError("未加入任何群组")
+            return
+        }
+        ws?.send(JSONObject().put("type", "chat").put("text", text).toString())
+    }
+
     // ---------------- 连接 ----------------
 
     private fun connect(url: String) {
@@ -283,10 +356,18 @@ class TalkService : Service() {
                 .put("id", id)
                 .put("kind", "android")
                 .put("proto", 1)
-            // 重装后凭恢复码找回原设备身份(服务器据此下发历史群组)
-            getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_RECOVERY, null)
-                ?.takeIf { it.matches(Regex("\\d{10}")) }
-                ?.let { hello.put("recovery", it) }
+            // 恢复码:优先本地缓存,其次 Downloads 文件(卸载重装后仍存在)
+            val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+            var rec = prefs.getString(KEY_RECOVERY, null)
+            if (rec.isNullOrEmpty() || !rec.matches(Regex("\\d{10}"))) {
+                rec = RecoveryStore.load(this@TalkService)
+                if (rec != null && rec.matches(Regex("\\d{10}"))) {
+                    prefs.edit().putString(KEY_RECOVERY, rec).apply()
+                } else {
+                    rec = null
+                }
+            }
+            rec?.let { hello.put("recovery", it) }
             webSocket.send(hello.toString())
             setStatus("已连接: $url")
         }
@@ -339,12 +420,15 @@ class TalkService : Service() {
                 obj.optJSONObject("device")?.optString("name")?.let {
                     if (it.isNotEmpty()) myDeviceName = it
                 }
-                // 保存服务器下发的恢复码(权威值),重装后凭它找回身份
+                // 保存服务器下发的恢复码(权威值):本地缓存 + Downloads 文件
                 obj.optJSONObject("device")?.optString("recovery_code")
                     ?.takeIf { it.matches(Regex("\\d{10}")) }
-                    ?.let {
-                        getSharedPreferences(PREFS, MODE_PRIVATE)
-                            .edit().putString(KEY_RECOVERY, it).apply()
+                    ?.let { code ->
+                        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+                        if (prefs.getString(KEY_RECOVERY, null) != code) {
+                            prefs.edit().putString(KEY_RECOVERY, code).apply()
+                        }
+                        RecoveryStore.save(this@TalkService, code)
                     }
                 val arr = obj.optJSONArray("groups") ?: return
                 val list = mutableListOf<GroupInfo>()
@@ -416,6 +500,28 @@ class TalkService : Service() {
                     )
                 }
                 listeners.forEach { it.onMembers(gid, list) }
+            }
+            "chat" -> {
+                val from = obj.optString("from_name", "")
+                val text = obj.optString("text", "")
+                val ts = obj.optString("ts", "")
+                listeners.forEach { it.onChat(from, text, ts) }
+            }
+            "chat_history" -> {
+                val gid = obj.optInt("group_id")
+                val arr = obj.optJSONArray("messages")
+                val list = mutableListOf<ChatMsg>()
+                for (i in 0 until (arr?.length() ?: 0)) {
+                    val m = arr!!.getJSONObject(i)
+                    list.add(
+                        ChatMsg(
+                            m.optString("from_name", ""),
+                            m.optString("text", ""),
+                            m.optString("ts", "")
+                        )
+                    )
+                }
+                listeners.forEach { it.onChatHistory(gid, list) }
             }
         }
     }

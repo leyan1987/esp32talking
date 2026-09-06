@@ -31,6 +31,7 @@ import java.util.concurrent.TimeUnit
 
 data class GroupInfo(val id: Int, val name: String)
 data class MemberInfo(val id: String, val name: String, val online: Boolean)
+data class ChatMsg(val fromName: String, val text: String, val ts: String)
 
 /**
  * esp32talking 安卓客户端 (M2.2) — 界面层。
@@ -54,6 +55,10 @@ class MainActivity : Activity() {
     private lateinit var btnMyName: Button
     private lateinit var btnGain: Button
     private lateinit var btnDevCode: Button
+    private lateinit var scrollMessages: android.widget.ScrollView
+    private lateinit var llMessages: LinearLayout
+    private lateinit var etChat: EditText
+    private lateinit var btnSend: Button
     private lateinit var etServer: EditText
     private lateinit var btnConnect: Button
     private lateinit var btnPtt: Button
@@ -121,6 +126,18 @@ class MainActivity : Activity() {
                 renderMembers(members)
             }
         }
+
+        override fun onChat(fromName: String, text: String, ts: String) = runOnUiThread {
+            addChatLine("$fromName: $text", ts)
+        }
+
+        override fun onChatHistory(groupId: Int, messages: List<ChatMsg>) = runOnUiThread {
+            if (groupId != activeGroupId) return@runOnUiThread
+            llMessages.removeAllViews()
+            for (m in messages) {
+                addChatLine("${m.fromName}: ${m.text}", m.ts)
+            }
+        }
     }
 
     private val conn = object : ServiceConnection {
@@ -144,6 +161,10 @@ class MainActivity : Activity() {
         btnMyName = findViewById(R.id.btnMyName)
         btnGain = findViewById(R.id.btnGain)
         btnDevCode = findViewById(R.id.btnDevCode)
+        scrollMessages = findViewById(R.id.scrollMessages)
+        llMessages = findViewById(R.id.llMessages)
+        etChat = findViewById(R.id.etChat)
+        btnSend = findViewById(R.id.btnSend)
         etServer = findViewById(R.id.etServer)
         btnConnect = findViewById(R.id.btnConnect)
         btnPtt = findViewById(R.id.btnPtt)
@@ -204,6 +225,16 @@ class MainActivity : Activity() {
         }
         btnDevCode.setOnClickListener {
             showDeviceCodeDialog()
+        }
+        btnSend.setOnClickListener {
+            val text = etChat.text.toString().trim()
+            if (text.isEmpty()) return@setOnClickListener
+            if (activeGroupId == null) {
+                toast("未加入任何群组")
+                return@setOnClickListener
+            }
+            svc?.sendChat(text)
+            etChat.setText("")
         }
 
         btnPtt.setOnTouchListener { _, e ->
@@ -282,6 +313,12 @@ class MainActivity : Activity() {
     private fun updateGroups(list: List<GroupInfo>, active: Int?) {
         groups.clear()
         groups.addAll(list)
+        val newActive = active ?: list.firstOrNull()?.id
+        // 切换了群组:清空消息区,等待服务器的 chat_history 补发
+        if (newActive != activeGroupId) {
+            llMessages.removeAllViews()
+        }
+        activeGroupId = newActive
         spinnerBusy = true
         val names =
             if (groups.isEmpty()) mutableListOf("(未加入群组)")
@@ -301,6 +338,28 @@ class MainActivity : Activity() {
             floorHolder != null && floorHolder != myName -> "等候:$floorHolder 讲话中"
             else -> "按住 说话"
         }
+    }
+
+    /** 追加一条文字消息,超过 60 条移除最旧的,并滚动到底部 */
+    private fun addChatLine(content: String, ts: String) {
+        val label = if (ts.isNotEmpty()) "[$ts] " else ""
+        llMessages.addView(
+            TextView(this).apply {
+                text = SpannableString(label + content).apply {
+                    // 昵称加粗效果用颜色区分时间戳
+                    setSpan(
+                        ForegroundColorSpan(0xFF888888.toInt()),
+                        0, label.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                    )
+                }
+                textSize = 14f
+                setPadding(0, dp(3), 0, dp(3))
+            }
+        )
+        while (llMessages.childCount > 60) {
+            llMessages.removeViewAt(0)
+        }
+        scrollMessages.post { scrollMessages.fullScroll(View.FOCUS_DOWN) }
     }
 
     /** 设备恢复码:查看当前码 / 重装后凭旧码找回设备身份与历史群组 */
