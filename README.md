@@ -14,11 +14,12 @@
 - ✅ 设备管理:首次连接自动注册(ESP32 按 MAC、安卓按 UUID),可改名/禁用/删除;禁用立即踢下线且无法重连
 - ✅ 群组:每个群组有 **6 位数字群号**,安卓可新建群组、凭群号加入;ESP32 在 `config.h` 里填群号自动加入(或由管理台拉人)
 - ✅ 多群组:设备可加入多个群组,每台设备有"当前群组",语音只路由给当前群组相同的在线成员
-- ✅ Web 管理台:浏览器打开 `http://<服务器IP>:8000/`
-- ✅ 安卓端:新建群组 / 群号加入 / 切换当前群组 / 群组改名 / 群成员在线状态 / 自改昵称
+- ✅ **话权控制(M3)**:同组同时只允许一人说话;按键先申请话权(先到先得),松开释放;**设备优先级 0~9,高者可抢占**;持话权 15 秒无音频自动释放;未授权音频被服务器丢弃
+- ✅ Web 管理台:浏览器打开 `http://<服务器IP>:8000/`,**登录后使用**(默认密码 `admin123`,请立即修改)
+- ✅ 安卓端:新建群组 / 群号加入 / 切换当前群组 / 群组改名 / 群成员在线状态 / 自改昵称 / 话权等待与抢占提示
 - ✅ 安卓保活:前台服务 + CPU/WiFi 锁,灭屏、划掉 App 后仍保持在线
 - ✅ 设备身份:安卓用 ANDROID_ID 派生稳定 ID,重装 App 不丢群组
-- ⏳ M3 待做:话权控制(先按先得)、ADPCM 压缩
+- ⏳ M3 剩余:ADPCM 压缩(带宽降 75%)
 
 ## 快速开始
 
@@ -47,7 +48,7 @@ python -m venv .venv
 
 也可以双击 `server\start_server.bat` 启动。
 
-- 管理台:`http://<服务器IP>:8000/`(新增设备、建群、拉成员、切当前群组、禁用/删除)
+- 管理台:`http://<服务器IP>:8000/`,**需登录**(默认密码 `admin123`,登录后右上角"修改密码"立即更换;也可用环境变量 `ESP32TALKING_ADMIN` 设初始密码);管理台可新增设备、建群、拉成员、切当前群组、设置话权优先级、禁用/删除
 - 数据库:`server/esp32talking.db`(SQLite,可随时备份/删除重置)
 - 单机自环测试(听到自己的回放,仅调试用):
   PowerShell: `$env:ESP32TALKING_ECHO="1"; .venv\Scripts\python server.py`
@@ -79,7 +80,8 @@ python -m venv .venv
 
 ## 协议速查(WebSocket)
 
-- 文本帧 JSON:`hello{id,kind,join_code?}` → `welcome{device,groups,active_group_id}`(join_code 存在时自动入群);`create_group{name}` → `created{group_id,name}` + `groups{...}`;`join_group{code}` → `groups{...}`(群号错误回 `error`);`select_group{group_id}`、`list_groups` → `groups{...}`;被禁用收 `rejected{reason}` 后被断开
+- 文本帧 JSON:`hello{id,kind,join_code?}` → `welcome{device,groups,active_group_id}`(join_code 存在时自动入群);`create_group{name}` → `created{group_id,name}` + `groups{...}`;`join_group{code}` → `groups{...}`(群号错误回 `error`);`select_group{group_id}`、`list_groups` → `groups{...}`;`set_name{name}` → `device_info`;`rename_group{group_id,name}`(仅限自己所在群组)、`list_members{group_id}` → `members{...}`;被禁用收 `rejected{reason}` 后被断开
+- **话权(M3)**:`ptt_request` → `ptt_grant` 或 `ptt_deny{holder_name}`;`ptt_release` 释放;被抢占收 `ptt_revoke`;群内广播 `ptt_status{held,holder_name}`;未持话权的音频帧被服务器丢弃
 - 二进制帧:640 字节 PCM,服务器按发送方"当前群组"转发给同组其他在线成员,不回发给发送方
 
 ## 硬件清单(每台 ESP32 设备)

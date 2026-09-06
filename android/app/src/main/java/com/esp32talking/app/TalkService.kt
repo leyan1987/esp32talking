@@ -23,8 +23,6 @@ import android.util.Log
 import android.widget.Toast
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
@@ -76,6 +74,12 @@ class TalkService : Service() {
         fun onError(message: String)
         fun onRejected(reason: String)
         fun onTalkingChanged(talking: Boolean)
+
+        /** 当前群组话权变化:holderName 为 null 表示空闲 */
+        fun onFloorChanged(holderName: String?)
+
+        /** list_members 查询结果 */
+        fun onMembers(groupId: Int, members: List<MemberInfo>)
     }
 
     inner class LocalBinder : Binder() {
@@ -106,6 +110,10 @@ class TalkService : Service() {
     private val talking = AtomicBoolean(false)
     private var record: AudioRecord? = null
     private var recordThread: Thread? = null
+
+    // ---- 话权(M3):按键先申请,授权后才开始采集 ----
+    @Volatile private var pendingTalk = false
+    private var grantTimeout: Runnable? = null
 
     // ---- 播放 ----
     private var track: AudioTrack? = null
@@ -216,33 +224,25 @@ class TalkService : Service() {
         ws?.send(JSONObject().put("type", "set_name").put("name", name).toString())
     }
 
-    /** 通过 REST 改群组名,成功后刷新群组列表 */
+    /** 修改自己所在群组的名称(走 WS,REST 已加管理台鉴权) */
     fun renameGroup(groupId: Int, newName: String) {
-        val base = (serverUrl ?: return)
-            .replaceFirst("ws://", "http://")
-            .replaceFirst("wss://", "https://")
-            .removeSuffix("/ws")
-        Thread {
-            try {
-                val body = JSONObject().put("name", newName).toString()
-                    .toRequestBody("application/json".toMediaType())
-                val req = Request.Builder()
-                    .url("$base/api/groups/$groupId")
-                    .patch(body)
-                    .build()
-                http.newCall(req).execute().use { resp ->
-                    if (resp.isSuccessful) {
-                        requestGroups()
-                        ui.post { toast("已重命名") }
-                    } else {
-                        ui.post { toast("重命名失败: HTTP ${resp.code}") }
-                    }
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "rename failed", e)
-                ui.post { toast("重命名失败: ${e.message}") }
-            }
-        }.start()
+        if (ws == null) {
+            notifyError("请先连接服务器")
+            return
+        }
+        ws?.send(
+            JSONObject()
+                .put("type", "rename_group")
+                .put("group_id", groupId)
+                .put("name", newName)
+                .toString()
+        )
+    }
+
+    /** 查询某群组成员在线状态,结果经 onMembers 回调 */
+    fun requestMembers(groupId: Int) {
+        if (ws == null) return
+        ws?.send(JSONObject().put("type", "list_members").put("group_id", groupId).toString())
     }
 
     // ---------------- 连接 ----------------
@@ -347,6 +347,46 @@ class TalkService : Service() {
             "rejected" -> {
                 listeners.forEach { it.onRejected(obj.optString("reason", "被拒绝")) }
             }
+            "ptt_grant" -> ui.post {
+                if (pendingTalk) {
+                    cancelPendingTalk()
+                    beginRecording()
+                } else {
+                    // 迟到的授权:退还话权
+                    ws?.send("{\"type\":\"ptt_release\"}")
+                }
+            }
+            "ptt_deny" -> {
+                cancelPendingTalk()
+                val holder = obj.optString("holder_name", "他人")
+                listeners.forEach { it.onError("「$holder」正在讲话,请稍后再试") }
+            }
+            "ptt_revoke" -> ui.post {
+                if (talking.get()) {
+                    stopRecording()
+                    listeners.forEach { it.onError("话权被更高优先级抢占") }
+                }
+            }
+            "ptt_status" -> {
+                val held = obj.optBoolean("held", false)
+                val holder = if (held) obj.optString("holder_name", "") else null
+                listeners.forEach { it.onFloorChanged(holder) }
+            }
+            "members" -> {
+                val gid = obj.optInt("group_id")
+                val arr = obj.optJSONArray("members")
+                val list = mutableListOf<MemberInfo>()
+                for (i in 0 until (arr?.length() ?: 0)) {
+                    val m = arr!!.getJSONObject(i)
+                    list.add(
+                        MemberInfo(
+                            m.getString("id"), m.getString("name"),
+                            m.optBoolean("online", false)
+                        )
+                    )
+                }
+                listeners.forEach { it.onMembers(gid, list) }
+            }
         }
     }
 
@@ -360,20 +400,31 @@ class TalkService : Service() {
         listeners.forEach { it.onGroups(snapshot, activeGroupId) }
     }
 
-    // ---------------- PTT 采集 ----------------
+    // ---------------- PTT 话权 ----------------
 
-    /** 返回 false 表示当前不能开始讲话(未连接/无群组/无权限由 Activity 处理) */
-    fun startTalk(): Boolean {
-        if (talking.get()) return true
+    /** PTT 按下:先向服务器申请话权,授权后自动开始采集 */
+    fun startTalk() {
+        if (talking.get() || pendingTalk) return
         if (ws == null) {
             ui.post { toast("请先连接服务器") }
-            return false
+            return
         }
         if (activeGroupId == null) {
             ui.post { toast("未加入任何群组,请先新建或加入群组") }
-            return false
+            return
         }
+        pendingTalk = true
+        ws?.send("{\"type\":\"ptt_request\"}")
+        grantTimeout = Runnable {
+            if (pendingTalk && !talking.get()) {
+                cancelPendingTalk()
+                notifyError("话权申请超时,请松开重试")
+                ws?.send("{\"type\":\"ptt_release\"}")
+            }
+        }.also { ui.postDelayed(it, 2500) }
+    }
 
+    private fun beginRecording() {
         // 半双工:开始讲话时丢弃待播放内容
         synchronized(playLock) { playQueue.clear() }
         talking.set(true)
@@ -427,11 +478,23 @@ class TalkService : Service() {
             } catch (_: IllegalStateException) {
             }
         }.also { it.start() }
-        return true
     }
 
     fun stopTalk() {
-        if (!talking.getAndSet(false)) return
+        cancelPendingTalk()
+        if (talking.get()) stopRecording()
+        // 无论是否真正持有话权,统一发释放(服务器无匹配时忽略)
+        ws?.send("{\"type\":\"ptt_release\"}")
+    }
+
+    private fun cancelPendingTalk() {
+        pendingTalk = false
+        grantTimeout?.let { ui.removeCallbacks(it) }
+        grantTimeout = null
+    }
+
+    private fun stopRecording() {
+        talking.set(false)
         listeners.forEach { it.onTalkingChanged(false) }
         recordThread?.join(500)
         recordThread = null
@@ -439,12 +502,8 @@ class TalkService : Service() {
     }
 
     private fun stopTalkingInternal() {
-        if (talking.getAndSet(false)) {
-            listeners.forEach { it.onTalkingChanged(false) }
-            recordThread?.join(500)
-            recordThread = null
-            record = null
-        }
+        cancelPendingTalk()
+        if (talking.get()) stopRecording()
     }
 
     // ---------------- 播放 ----------------

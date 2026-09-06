@@ -18,42 +18,68 @@
   .row-form { margin: 10px 0; display: flex; gap: 8px; flex-wrap: wrap; }
   .chip { display: inline-block; background: #eef; border: 1px solid #ccd; border-radius: 10px; padding: 1px 8px; margin: 1px 3px; font-size: 12px; }
   .chip button { border: none; background: none; color: #c00; padding: 0 0 0 4px; font-size: 12px; }
-  .toast { position: fixed; top: 12px; right: 12px; background: #333; color: #fff; padding: 8px 14px; border-radius: 6px; display: none; font-size: 14px; }
+  .toast { position: fixed; top: 12px; right: 12px; background: #333; color: #fff; padding: 8px 14px; border-radius: 6px; display: none; font-size: 14px; z-index: 9; }
   small.hint { color: #888; }
+  #loginView { max-width: 380px; margin: 96px auto 0; text-align: center; border: 1px solid #ddd; border-radius: 10px; padding: 36px 28px; }
+  #loginView input { width: 100%; box-sizing: border-box; margin: 14px 0; padding: 10px; font-size: 16px; }
+  #loginView button { width: 100%; padding: 10px; font-size: 16px; background: #2563eb; color: #fff; border: none; border-radius: 6px; }
+  #loginErr { color: #c00; font-size: 13px; min-height: 18px; }
+  .toolbar { float: right; display: flex; gap: 8px; }
+  #warnBanner { background: #fff3cd; border: 1px solid #ffe08a; color: #8a6d00; padding: 8px 12px; border-radius: 6px; margin-top: 12px; font-size: 13px; }
+  .prioInput { width: 52px; }
 </style>
 </head>
 <body>
-<h1>esp32talking 管理台 <small class="hint" id="onlineHint"></small></h1>
 
-<h2>设备管理 <small class="hint">ESP32 按 MAC、安卓按 UUID 自动注册;禁用后立即踢下线且无法重连</small></h2>
-<div class="row-form">
-  <input id="newDevId" placeholder="设备 ID / MAC,如 A4:CF:12:..">
-  <input id="newDevName" placeholder="备注名(可选)">
-  <button onclick="addDevice()">新增设备</button>
+<!-- 登录视图 -->
+<div id="loginView" style="display:none">
+  <h1>esp32talking 管理台</h1>
+  <input id="loginPwd" type="password" placeholder="管理密码" onkeydown="if(event.key==='Enter')doLogin()">
+  <button onclick="doLogin()">登 录</button>
+  <div id="loginErr"></div>
+  <p class="hint">首次使用默认密码 admin123,登录后请立即修改</p>
 </div>
-<table>
-  <thead><tr>
-    <th>设备 ID</th><th>名称</th><th>状态</th><th>已启用</th>
-    <th>所在群组</th><th>当前群组(监听/通讯)</th><th>最后在线</th><th>操作</th>
-  </tr></thead>
-  <tbody id="devRows"></tbody>
-</table>
 
-<h2>群组管理 <small class="hint">群号为 6 位数字,安卓端可凭群号自行加入;设备可加入多个群组</small></h2>
-<div class="row-form">
-  <input id="newGroupName" placeholder="新群组名称">
-  <button onclick="createGroup()">创建群组</button>
+<!-- 主视图 -->
+<div id="mainView" style="display:none">
+  <div class="toolbar">
+    <button onclick="changePwd()">修改密码</button>
+    <button onclick="doLogout()">退出登录</button>
+  </div>
+  <h1>esp32talking 管理台 <small class="hint" id="onlineHint"></small></h1>
+  <div id="warnBanner" style="display:none">⚠ 正在使用默认密码,请尽快点击右上角"修改密码"!</div>
+
+  <h2>设备管理 <small class="hint">ESP32 按 MAC、安卓按 UUID 自动注册;禁用后立即踢下线且无法重连;优先级高的话权可抢占</small></h2>
+  <div class="row-form">
+    <input id="newDevId" placeholder="设备 ID / MAC,如 A4:CF:12:..">
+    <input id="newDevName" placeholder="备注名(可选)">
+    <button onclick="addDevice()">新增设备</button>
+  </div>
+  <table>
+    <thead><tr>
+      <th>设备 ID</th><th>名称</th><th>状态</th><th>已启用</th><th>优先级</th>
+      <th>所在群组</th><th>当前群组(监听/通讯)</th><th>最后在线</th><th>操作</th>
+    </tr></thead>
+    <tbody id="devRows"></tbody>
+  </table>
+
+  <h2>群组管理 <small class="hint">群号为 6 位数字,安卓端可凭群号自行加入;设备可加入多个群组</small></h2>
+  <div class="row-form">
+    <input id="newGroupName" placeholder="新群组名称">
+    <button onclick="createGroup()">创建群组</button>
+  </div>
+  <table>
+    <thead><tr>
+      <th>群号</th><th>群组名</th><th>成员</th><th>添加成员</th><th>操作</th>
+    </tr></thead>
+    <tbody id="groupRows"></tbody>
+  </table>
 </div>
-<table>
-  <thead><tr>
-    <th>群号</th><th>群组名</th><th>成员</th><th>添加成员</th><th>操作</th>
-  </tr></thead>
-  <tbody id="groupRows"></tbody>
-</table>
 
 <div class="toast" id="toast"></div>
 
 <script>
+let token = localStorage.getItem('ett_token') || '';
 let devices = [], groups = [];
 
 function toast(msg) {
@@ -65,9 +91,13 @@ function toast(msg) {
 async function api(method, url, body) {
   const resp = await fetch(url, {
     method,
-    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    headers: {
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+      ...(token ? { 'X-Auth-Token': token } : {}),
+    },
     body: body ? JSON.stringify(body) : undefined,
   });
+  if (resp.status === 401) { showLogin(); throw new Error('未登录'); }
   if (!resp.ok) {
     let msg = resp.status;
     try { msg = (await resp.json()).detail || msg; } catch (e) {}
@@ -76,28 +106,75 @@ async function api(method, url, body) {
   return resp.status === 200 ? resp.json() : null;
 }
 
+function showLogin() {
+  localStorage.removeItem('ett_token'); token = '';
+  document.getElementById('mainView').style.display = 'none';
+  document.getElementById('loginView').style.display = 'block';
+}
+
+async function showMain() {
+  document.getElementById('loginView').style.display = 'none';
+  document.getElementById('mainView').style.display = 'block';
+  await refresh();
+}
+
+async function doLogin() {
+  const pwd = document.getElementById('loginPwd').value;
+  try {
+    const resp = await fetch('/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: pwd }),
+    });
+    if (!resp.ok) {
+      document.getElementById('loginErr').textContent = '密码错误';
+      return;
+    }
+    const data = await resp.json();
+    token = data.token;
+    localStorage.setItem('ett_token', token);
+    document.getElementById('warnBanner').style.display = data.default_password ? 'block' : 'none';
+    showMain();
+  } catch (e) {
+    document.getElementById('loginErr').textContent = '登录失败: ' + e.message;
+  }
+}
+
+async function doLogout() {
+  try { await api('POST', '/api/logout'); } catch (e) {}
+  showLogin();
+}
+
+async function changePwd() {
+  const old_ = prompt('旧密码');
+  if (old_ === null) return;
+  const nw = prompt('新密码(至少 6 位)');
+  if (nw === null) return;
+  try {
+    await api('POST', '/api/password', { old: old_, new: nw });
+    toast('密码已修改');
+    document.getElementById('warnBanner').style.display = 'none';
+  } catch (e) { toast(e.message); }
+}
+
 async function refresh() {
+  if (!token) return;
   try {
     const [d, g] = await Promise.all([api('GET', '/api/devices'), api('GET', '/api/groups')]);
     devices = d.devices; groups = g.groups;
     render();
-  } catch (e) { toast('刷新失败: ' + e.message); }
+  } catch (e) { if (e.message !== '未登录') toast('刷新失败: ' + e.message); }
 }
 
 function el(tag, attrs, ...children) {
   const n = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {
     if (k === 'text') n.textContent = v;
+    else if (k === 'style') n.style.cssText = v;
     else if (k.startsWith('on')) n.addEventListener(k.slice(2), v);
     else n.setAttribute(k, v);
   }
   children.forEach(c => n.appendChild(c));
   return n;
-}
-
-function groupName(id) {
-  const g = groups.find(g => g.id === id);
-  return g ? g.name : ('#' + id);
 }
 
 function render() {
@@ -123,6 +200,12 @@ function render() {
       activeSel.appendChild(o);
     });
 
+    const prioInput = el('input', {
+      class: 'prioInput', type: 'number', min: '0', max: '9', value: d.priority,
+      onchange: e => api('PATCH', '/api/devices/' + d.id, { priority: +e.target.value })
+        .then(refresh).catch(err => { toast(err.message); refresh(); })
+    });
+
     const op = el('td');
     op.appendChild(el('button', {
       class: 'mini', text: '改名',
@@ -142,6 +225,7 @@ function render() {
       el('td', { text: d.name }),
       el('td', { text: d.online ? '在线' : '离线', class: d.online ? 'on' : 'off' }),
       el('td', { text: d.enabled ? '是' : '否', class: d.enabled ? '' : 'dis' }),
+      el('td', null, prioInput),
       groupCell,
       el('td', null, activeSel),
       el('td', { text: d.last_seen || '-' }),
@@ -157,8 +241,7 @@ function render() {
     if (g.members.length === 0) members.textContent = '(空)';
     for (const m of g.members) {
       const chip = el('span', { class: 'chip' });
-      const dot = el('span', { text: m.online ? '● ' : '○ ', style: 'color:' + (m.online ? '#0a0' : '#bbb') + ';font-size:11px;' });
-      chip.appendChild(dot);
+      chip.appendChild(el('span', { text: m.online ? '● ' : '○ ', style: 'color:' + (m.online ? '#0a0' : '#bbb') + ';font-size:11px;' }));
       chip.appendChild(document.createTextNode(m.name + ' (' + m.id.slice(-4) + ')'));
       chip.appendChild(el('button', { text: '×', title: '移出', onclick: () => api('DELETE', `/api/groups/${g.id}/members/${m.id}`).then(refresh).catch(e2 => toast(e2.message)) }));
       members.appendChild(chip);
@@ -207,7 +290,14 @@ async function createGroup() {
   catch (e) { toast(e.message); }
 }
 
-refresh();
+// 初始化:有 token 则尝试进入主视图,否则显示登录
+if (token) {
+  refresh().then(() => {
+    if (token) showMain();
+  }).catch(showLogin);
+} else {
+  showLogin();
+}
 setInterval(refresh, 5000);
 </script>
 </body>

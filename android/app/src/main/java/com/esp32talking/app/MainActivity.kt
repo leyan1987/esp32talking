@@ -26,14 +26,11 @@ import android.widget.LinearLayout
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
-import okhttp3.OkHttpClient
-import okhttp3.Request
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 data class GroupInfo(val id: Int, val name: String)
-private data class MemberInfo(val id: String, val name: String, val online: Boolean)
-private data class GroupDetail(val id: Int, val name: String, val members: List<MemberInfo>)
+data class MemberInfo(val id: String, val name: String, val online: Boolean)
 
 /**
  * esp32talking 安卓客户端 (M2.2) — 界面层。
@@ -66,9 +63,6 @@ class MainActivity : Activity() {
     private lateinit var btnMembers: Button
 
     private val ui = Handler(Looper.getMainLooper())
-    private val rest = OkHttpClient.Builder()
-        .connectTimeout(5, TimeUnit.SECONDS)
-        .build()
 
     private var svc: TalkService? = null
     private var bound = false
@@ -76,6 +70,14 @@ class MainActivity : Activity() {
     private val groups = mutableListOf<GroupInfo>()
     private var activeGroupId: Int? = null
     private var spinnerBusy = false
+    private var myName: String? = null
+    private var floorHolder: String? = null
+    private var talkingNow = false
+
+    // 成员弹窗(WS 轮询刷新)
+    private var membersDialog: AlertDialog? = null
+    private var membersContainer: LinearLayout? = null
+    private var membersGid: Int? = null
 
     private val listener = object : TalkService.Listener {
         override fun onStatus(status: String) = runOnUiThread {
@@ -84,7 +86,9 @@ class MainActivity : Activity() {
         }
 
         override fun onDeviceInfo(name: String) = runOnUiThread {
+            myName = name.ifEmpty { null }
             tvMyName.text = if (name.isEmpty()) "昵称: -" else "昵称: $name"
+            updatePttButton()
         }
 
         override fun onGroups(list: List<GroupInfo>, active: Int?) = runOnUiThread {
@@ -102,7 +106,19 @@ class MainActivity : Activity() {
         }
 
         override fun onTalkingChanged(talking: Boolean) = runOnUiThread {
-            btnPtt.text = if (talking) "正在讲话…" else "按住 说话"
+            talkingNow = talking
+            updatePttButton()
+        }
+
+        override fun onFloorChanged(holderName: String?) = runOnUiThread {
+            floorHolder = holderName
+            updatePttButton()
+        }
+
+        override fun onMembers(groupId: Int, members: List<MemberInfo>) = runOnUiThread {
+            if (groupId == membersGid && membersDialog?.isShowing == true) {
+                renderMembers(members)
+            }
         }
     }
 
@@ -273,9 +289,17 @@ class MainActivity : Activity() {
         spinnerBusy = false
     }
 
+    /** PTT 按钮文案:由"我在讲话 / 他人持话权 / 空闲"三种状态驱动 */
+    private fun updatePttButton() {
+        btnPtt.text = when {
+            talkingNow -> "正在讲话…"
+            floorHolder != null && floorHolder != myName -> "等候:$floorHolder 讲话中"
+            else -> "按住 说话"
+        }
+    }
+
     /** 修改自己的昵称 */
-    private fun showNicknameDialog() {
-        if (svc?.isConnected() != true) {
+    private fun showNicknameDialog() {        if (svc?.isConnected() != true) {
             toast("请先连接服务器")
             return
         }
@@ -358,11 +382,15 @@ class MainActivity : Activity() {
             .show()
     }
 
-    /** 群组成员在线状态(每 3 秒自动刷新,关窗即停) */
+    /** 群组成员在线状态(WS 轮询,每 3 秒刷新,关窗即停) */
     private fun showMembersDialog() {
         val gid = activeGroupId
         if (gid == null) {
             toast("未加入任何群组")
+            return
+        }
+        if (svc?.isConnected() != true) {
+            toast("请先连接服务器")
             return
         }
         val container = LinearLayout(this).apply {
@@ -375,30 +403,42 @@ class MainActivity : Activity() {
             .setPositiveButton("关闭", null)
             .create()
 
+        membersGid = gid
+        membersContainer = container
+        membersDialog = dialog
+
         val poll = object : Runnable {
             override fun run() {
-                fetchGroupDetail(gid) { detail ->
-                    if (!dialog.isShowing) return@fetchGroupDetail
-                    container.removeAllViews()
-                    if (detail == null || detail.members.isEmpty()) {
-                        addMemberRow(container, "○", "暂无成员", false)
-                    } else {
-                        for (m in detail.members.sortedByDescending { it.online }) {
-                            addMemberRow(
-                                container,
-                                if (m.online) "●" else "○",
-                                "${m.name}  (${m.id.takeLast(4)})",
-                                m.online
-                            )
-                        }
-                    }
-                    ui.postDelayed(this, 3000)
-                }
+                if (membersDialog?.isShowing != true) return
+                svc?.requestMembers(gid)
+                ui.postDelayed(this, 3000)
             }
         }
         dialog.setOnShowListener { poll.run() }
-        dialog.setOnDismissListener { ui.removeCallbacks(poll) }
+        dialog.setOnDismissListener {
+            ui.removeCallbacks(poll)
+            membersDialog = null
+            membersContainer = null
+            membersGid = null
+        }
         dialog.show()
+    }
+
+    private fun renderMembers(members: List<MemberInfo>) {
+        val container = membersContainer ?: return
+        container.removeAllViews()
+        if (members.isEmpty()) {
+            addMemberRow(container, "○", "暂无成员", false)
+        } else {
+            for (m in members.sortedByDescending { it.online }) {
+                addMemberRow(
+                    container,
+                    if (m.online) "●" else "○",
+                    "${m.name}  (${m.id.takeLast(4)})",
+                    m.online
+                )
+            }
+        }
     }
 
     private fun addMemberRow(container: LinearLayout, dot: String, text: String, online: Boolean) {
@@ -414,48 +454,6 @@ class MainActivity : Activity() {
                 setPadding(0, dp(8), 0, dp(8))
             }
         )
-    }
-
-    private fun fetchGroupDetail(groupId: Int, cb: (GroupDetail?) -> Unit) {
-        val url = etServer.text.toString().trim()
-        if (!url.startsWith("ws://") && !url.startsWith("wss://")) {
-            runOnUiThread { cb(null) }
-            return
-        }
-        val base = url.replaceFirst("ws://", "http://")
-            .replaceFirst("wss://", "https://")
-            .removeSuffix("/ws")
-        Thread {
-            var result: GroupDetail? = null
-            try {
-                val req = Request.Builder().url("$base/api/groups").build()
-                rest.newCall(req).execute().use { resp ->
-                    val obj = JSONObject(resp.body?.string() ?: "")
-                    val arr = obj.optJSONArray("groups") ?: return@use
-                    for (i in 0 until arr.length()) {
-                        val g = arr.getJSONObject(i)
-                        if (g.getInt("id") != groupId) continue
-                        val members = mutableListOf<MemberInfo>()
-                        val marr = g.optJSONArray("members")
-                        for (j in 0 until (marr?.length() ?: 0)) {
-                            val m = marr!!.getJSONObject(j)
-                            members.add(
-                                MemberInfo(
-                                    m.getString("id"),
-                                    m.getString("name"),
-                                    m.optBoolean("online", false)
-                                )
-                            )
-                        }
-                        result = GroupDetail(g.getInt("id"), g.getString("name"), members)
-                        break
-                    }
-                }
-            } catch (e: Exception) {
-                android.util.Log.w(TAG, "fetch groups failed", e)
-            }
-            runOnUiThread { cb(result) }
-        }.start()
     }
 
     // ---------------- 杂项 ----------------

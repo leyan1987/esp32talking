@@ -36,10 +36,12 @@ import logging
 import os
 import random
 import sqlite3
+import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -48,6 +50,7 @@ log = logging.getLogger("esp32talking")
 DB_PATH = Path(__file__).parent / "esp32talking.db"
 ADMIN_HTML = Path(__file__).parent / "static" / "admin.html"
 ECHO_TO_SENDER = os.environ.get("ESP32TALKING_ECHO", "0") == "1"
+FLOOR_TIMEOUT = float(os.environ.get("ESP32TALKING_FLOOR_TIMEOUT", "15"))  # 秒,无音频自动释放
 
 app = FastAPI(title="esp32talking")
 
@@ -61,6 +64,7 @@ db.executescript(
         id TEXT PRIMARY KEY,          -- ESP32 的 MAC 或安卓的 UUID
         name TEXT NOT NULL,
         enabled INTEGER NOT NULL DEFAULT 1,
+        priority INTEGER NOT NULL DEFAULT 0,  -- 话权优先级 0~9,高者可抢占
         active_group_id INTEGER,
         created_at TEXT DEFAULT (datetime('now','localtime')),
         last_seen TEXT
@@ -75,15 +79,72 @@ db.executescript(
         device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
         PRIMARY KEY(group_id, device_id)
     );
+    CREATE TABLE IF NOT EXISTS settings(
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
     """
 )
 db.execute("PRAGMA foreign_keys=ON")
+
+# 旧库升级:devices 补 priority 列
+try:
+    db.execute("ALTER TABLE devices ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
+    db.commit()
+except sqlite3.OperationalError:
+    pass  # 列已存在
 
 
 def now() -> str:
     import datetime
 
     return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+# ---------------- 管理台鉴权 ----------------
+
+auth_tokens: set[str] = set()
+ADMIN_DEFAULT_PASSWORD = os.environ.get("ESP32TALKING_ADMIN", "admin123")
+
+
+def admin_password() -> str:
+    row = db.execute("SELECT value FROM settings WHERE key='admin_password'").fetchone()
+    return row["value"] if row else ADMIN_DEFAULT_PASSWORD
+
+
+async def auth_guard(x_auth_token: str | None = Header(default=None)):
+    if x_auth_token not in auth_tokens:
+        raise HTTPException(401, "未登录或登录已过期")
+
+
+# ---------------- 话权(同时只允许一人说话) ----------------
+
+# group_id -> {"device_id","conn_id","granted_at","last_audio"}
+floors: dict[int, dict] = {}
+
+
+def device_name(device_id: str) -> str:
+    r = db.execute("SELECT name FROM devices WHERE id = ?", (device_id,)).fetchone()
+    return r["name"] if r else device_id
+
+
+def device_priority(device_id: str) -> int:
+    r = db.execute("SELECT priority FROM devices WHERE id = ?", (device_id,)).fetchone()
+    return r["priority"] if r else 0
+
+
+async def broadcast_floor(gid: int) -> None:
+    f = floors.get(gid)
+    msg = {
+        "type": "ptt_status",
+        "group_id": gid,
+        "held": f is not None,
+        "holder_id": f["device_id"] if f else None,
+        "holder_name": device_name(f["device_id"]) if f else None,
+    }
+    for conn in list(conns.values()):
+        if gid in conn.member_groups and conn.active_group_id == gid:
+            await ws_send_json(conn, msg)
 
 
 def allocate_group_id() -> int:
@@ -112,6 +173,7 @@ class Conn:
     active_group_id: int | None = None
     member_groups: set[int] = field(default_factory=set)
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    audio_drops: int = 0  # 未持话权被丢弃的音频帧计数
 
 
 conns: dict[str, Conn] = {}          # conn_id -> Conn
@@ -268,6 +330,11 @@ async def ws_endpoint(ws: WebSocket) -> None:
             conns.pop(conn.conn_id, None)
             if conn_by_device.get(conn.device_id) == conn.conn_id:
                 conn_by_device.pop(conn.device_id, None)
+            # 释放该连接持有的话权
+            for gid, f in list(floors.items()):
+                if f["conn_id"] == conn.conn_id:
+                    floors.pop(gid, None)
+                    await broadcast_floor(gid)
             log.info("设备下线: %s (在线 %d)", conn.device_id, len(conns))
 
 
@@ -347,6 +414,72 @@ async def handle_text(conn: Conn, text: str) -> None:
         )
         log.info("设备 %s 修改昵称 -> %s", conn.device_id, name)
 
+    elif t == "ptt_request":
+        # 申请话权:仅对"当前群组";无主则授予,有人则比较优先级(高者抢占)
+        gid = conn.active_group_id
+        if gid is None or gid not in conn.member_groups:
+            await ws_send_json(conn, {"type": "error", "message": "未加入群组,无法申请话权"})
+            return
+        f = floors.get(gid)
+        if f is not None and f["conn_id"] in conns and f["device_id"] != conn.device_id:
+            if device_priority(conn.device_id) <= device_priority(f["device_id"]):
+                await ws_send_json(conn, {
+                    "type": "ptt_deny", "group_id": gid,
+                    "holder_name": device_name(f["device_id"]),
+                })
+                return
+            old = conns.get(f["conn_id"])
+            if old is not None:
+                await ws_send_json(old, {"type": "ptt_revoke", "group_id": gid})
+            log.info("话权抢占: 群组 %d %s -> %s", gid, f["device_id"], conn.device_id)
+        floors[gid] = {
+            "device_id": conn.device_id, "conn_id": conn.conn_id,
+            "granted_at": time.time(), "last_audio": time.time(),
+        }
+        await ws_send_json(conn, {"type": "ptt_grant", "group_id": gid})
+        await broadcast_floor(gid)
+        log.info("话权授予: 群组 %d -> %s", gid, conn.device_id)
+
+    elif t == "ptt_release":
+        gid = conn.active_group_id
+        f = floors.get(gid) if gid is not None else None
+        if f and f["device_id"] == conn.device_id:
+            floors.pop(gid, None)
+            await broadcast_floor(gid)
+
+    elif t == "rename_group":
+        # 客户端(安卓)改名自己所在的群组
+        gid = obj.get("group_id")
+        name = str(obj.get("name", "")).strip()[:20]
+        if not name:
+            await ws_send_json(conn, {"type": "error", "message": "群组名不能为空"})
+            return
+        if not isinstance(gid, int) or gid not in conn.member_groups:
+            await ws_send_json(conn, {"type": "error", "message": "只能修改自己所在的群组"})
+            return
+        db.execute("UPDATE groups SET name = ? WHERE id = ?", (name, gid))
+        db.commit()
+        for c in list(conns.values()):
+            if gid in c.member_groups:
+                await push_groups(c)
+
+    elif t == "list_members":
+        gid = obj.get("group_id")
+        if isinstance(gid, int) and gid in conn.member_groups:
+            rows = db.execute(
+                """SELECT d.id, d.name FROM devices d
+                   JOIN group_members m ON m.device_id = d.id
+                   WHERE m.group_id = ? ORDER BY d.id""",
+                (gid,),
+            ).fetchall()
+            await ws_send_json(conn, {
+                "type": "members", "group_id": gid,
+                "members": [
+                    {"id": r["id"], "name": r["name"], "online": r["id"] in conn_by_device}
+                    for r in rows
+                ],
+            })
+
     elif t == "list_groups":
         await push_groups(conn)
 
@@ -358,6 +491,17 @@ async def relay_audio(sender: Conn, data: bytes) -> None:
     gid = sender.active_group_id
     if gid is None:
         return
+    # 话权门控:未持话权的音频一律丢弃(M3)
+    f = floors.get(gid)
+    if f is None or f["device_id"] != sender.device_id:
+        sender.audio_drops += 1
+        if sender.audio_drops == 1 or sender.audio_drops % 200 == 0:
+            log.warning(
+                "%s(%s) 未持有群组 %d 话权,丢弃音频帧(累计 %d)",
+                sender.device_id, sender.conn_id, gid, sender.audio_drops,
+            )
+        return
+    f["last_audio"] = time.time()
     if ECHO_TO_SENDER:
         try:
             async with sender.send_lock:
@@ -384,6 +528,7 @@ def device_payload(r: sqlite3.Row) -> dict:
         "id": r["id"],
         "name": r["name"],
         "enabled": bool(r["enabled"]),
+        "priority": r["priority"],
         "online": r["id"] in conn_by_device,
         "active_group_id": r["active_group_id"],
         "last_seen": r["last_seen"],
@@ -396,13 +541,48 @@ async def admin_page():
     return FileResponse(ADMIN_HTML, media_type="text/html")
 
 
-@app.get("/api/devices")
+@app.post("/api/login")
+async def login(body: dict):
+    if str(body.get("password", "")) != admin_password():
+        raise HTTPException(401, "密码错误")
+    token = uuid.uuid4().hex
+    auth_tokens.add(token)
+    log.info("管理台登录成功")
+    return {"token": token, "default_password": admin_password() == "admin123"}
+
+
+@app.post("/api/logout")
+async def logout(x_auth_token: str | None = Header(default=None)):
+    auth_tokens.discard(x_auth_token or "")
+    return {"ok": True}
+
+
+@app.post("/api/password")
+async def change_password(body: dict, x_auth_token: str | None = Header(default=None)):
+    if x_auth_token not in auth_tokens:
+        raise HTTPException(401, "未登录或登录已过期")
+    old, new = str(body.get("old", "")), str(body.get("new", ""))
+    if old != admin_password():
+        raise HTTPException(400, "旧密码错误")
+    if len(new) < 6:
+        raise HTTPException(400, "新密码至少 6 位")
+    db.execute(
+        "INSERT INTO settings(key, value) VALUES('admin_password', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (new,),
+    )
+    db.commit()
+    log.info("管理台密码已修改")
+    return {"ok": True}
+
+
+@app.get("/api/devices", dependencies=[Depends(auth_guard)])
 async def list_devices():
     rows = db.execute("SELECT * FROM devices ORDER BY created_at").fetchall()
     return {"devices": [device_payload(r) for r in rows]}
 
 
-@app.post("/api/devices")
+@app.post("/api/devices", dependencies=[Depends(auth_guard)])
 async def add_device(body: dict):
     dev_id = str(body.get("id", "")).strip().upper()
     if not dev_id:
@@ -416,7 +596,7 @@ async def add_device(body: dict):
     return device_payload(r)
 
 
-@app.patch("/api/devices/{device_id}")
+@app.patch("/api/devices/{device_id}", dependencies=[Depends(auth_guard)])
 async def patch_device(device_id: str, body: dict):
     r = db.execute("SELECT * FROM devices WHERE id = ?", (device_id.upper(),)).fetchone()
     if r is None:
@@ -426,6 +606,12 @@ async def patch_device(device_id: str, body: dict):
     if "name" in body:
         updates.append("name = ?")
         args.append(str(body["name"]))
+    if "priority" in body:
+        p = body["priority"]
+        if not isinstance(p, int) or not (0 <= p <= 9):
+            raise HTTPException(400, "优先级取值 0~9")
+        updates.append("priority = ?")
+        args.append(p)
     if "enabled" in body:
         updates.append("enabled = ?")
         args.append(1 if body["enabled"] else 0)
@@ -463,7 +649,7 @@ async def patch_device(device_id: str, body: dict):
     return payload
 
 
-@app.delete("/api/devices/{device_id}")
+@app.delete("/api/devices/{device_id}", dependencies=[Depends(auth_guard)])
 async def delete_device(device_id: str):
     dev_id = device_id.upper()
     if db.execute("SELECT 1 FROM devices WHERE id = ?", (dev_id,)).fetchone() is None:
@@ -476,7 +662,7 @@ async def delete_device(device_id: str):
     return {"ok": True}
 
 
-@app.get("/api/groups")
+@app.get("/api/groups", dependencies=[Depends(auth_guard)])
 async def list_groups():
     rows = db.execute("SELECT * FROM groups ORDER BY id").fetchall()
     out = []
@@ -500,7 +686,7 @@ async def list_groups():
     return {"groups": out}
 
 
-@app.post("/api/groups")
+@app.post("/api/groups", dependencies=[Depends(auth_guard)])
 async def create_group(body: dict):
     name = str(body.get("name", "")).strip()
     if not name:
@@ -511,7 +697,7 @@ async def create_group(body: dict):
     return {"id": gid, "name": name, "members": []}
 
 
-@app.patch("/api/groups/{group_id}")
+@app.patch("/api/groups/{group_id}", dependencies=[Depends(auth_guard)])
 async def rename_group(group_id: int, body: dict):
     name = str(body.get("name", "")).strip()
     if not name:
@@ -527,7 +713,7 @@ async def rename_group(group_id: int, body: dict):
     return {"ok": True}
 
 
-@app.delete("/api/groups/{group_id}")
+@app.delete("/api/groups/{group_id}", dependencies=[Depends(auth_guard)])
 async def delete_group(group_id: int):
     if db.execute("SELECT 1 FROM groups WHERE id = ?", (group_id,)).fetchone() is None:
         raise HTTPException(404, "群组不存在")
@@ -549,7 +735,7 @@ async def delete_group(group_id: int):
     return {"ok": True}
 
 
-@app.post("/api/groups/{group_id}/members")
+@app.post("/api/groups/{group_id}/members", dependencies=[Depends(auth_guard)])
 async def add_member(group_id: int, body: dict):
     dev_id = str(body.get("device_id", "")).strip().upper()
     if db.execute("SELECT 1 FROM groups WHERE id = ?", (group_id,)).fetchone() is None:
@@ -574,7 +760,7 @@ async def add_member(group_id: int, body: dict):
     return {"ok": True}
 
 
-@app.delete("/api/groups/{group_id}/members/{device_id}")
+@app.delete("/api/groups/{group_id}/members/{device_id}", dependencies=[Depends(auth_guard)])
 async def remove_member(group_id: int, device_id: str):
     dev_id = device_id.upper()
     db.execute(
@@ -599,6 +785,23 @@ async def remove_member(group_id: int, device_id: str):
 @app.exception_handler(HTTPException)
 async def http_exc_handler(request, exc: HTTPException):
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
+@app.on_event("startup")
+async def start_floor_sweeper():
+    """定期清理话权超时(持有者 15 秒无音频自动释放)。"""
+
+    async def _sweep():
+        while True:
+            await asyncio.sleep(3)
+            now = time.time()
+            for gid, f in list(floors.items()):
+                if now - f["last_audio"] > FLOOR_TIMEOUT:
+                    floors.pop(gid, None)
+                    log.info("话权超时释放: 群组 %d (%s)", gid, f["device_id"])
+                    await broadcast_floor(gid)
+
+    asyncio.create_task(_sweep())
 
 
 if __name__ == "__main__":

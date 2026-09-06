@@ -21,8 +21,14 @@
 static WebSocketsClient ws;
 static bool wifiOk = false;
 static bool wsOk = false;
-static bool talking = false;
 static uint32_t lastWsTry = 0;
+
+// ---------- PTT 话权状态机 ----------
+// M3:按键先向服务器申请话权,拿到授权后才能发音频(服务器会丢弃无权音频)
+enum PttState : uint8_t { PTT_IDLE, PTT_REQUESTING, PTT_HOLDING };
+static PttState pttState = PTT_IDLE;
+static uint32_t pttRequestAt = 0;
+#define PTT_REQUEST_TIMEOUT_MS 2500
 
 // ---------- 播放环形缓冲 ----------
 // 裸 PCM 32KB/s 下 64KB ≈ 2 秒;96KB 会使经典 ESP32 的 DRAM 溢出,
@@ -170,10 +176,31 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t len) {
         case WStype_DISCONNECTED:
             if (wsOk) Serial.println("[WS] 连接断开");
             wsOk = false;
-            talking = false;
+            pttState = PTT_IDLE;
             break;
         case WStype_TEXT:
             Serial.printf("[WS] 收到文本: %.*s\n", (int)len, (const char *)payload);
+            // 话权消息(轻量匹配,避免引入 JSON 库)
+            if (strstr((const char *)payload, "\"ptt_grant\"") != nullptr) {
+                if (pttState == PTT_REQUESTING) {
+                    ringClear();
+                    pttState = PTT_HOLDING;
+                    Serial.println("[PTT] 获得话权,开始讲话");
+                } else {
+                    // 迟到的授权:退还话权
+                    ws.sendTXT("{\"type\":\"ptt_release\"}");
+                }
+            } else if (strstr((const char *)payload, "\"ptt_deny\"") != nullptr) {
+                if (pttState == PTT_REQUESTING) {
+                    pttState = PTT_IDLE;
+                    Serial.println("[PTT] 他人正在讲话,未获话权");
+                }
+            } else if (strstr((const char *)payload, "\"ptt_revoke\"") != nullptr) {
+                if (pttState == PTT_HOLDING) {
+                    pttState = PTT_IDLE;
+                    Serial.println("[PTT] 话权被更高优先级抢占");
+                }
+            }
             break;
         case WStype_BIN:
             ringPush(payload, len);
@@ -185,7 +212,7 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t len) {
 
 // ---------- LED ----------
 static void ledUpdate() {
-    if (talking) {
+    if (pttState == PTT_HOLDING) {
         digitalWrite(STATUS_LED_PIN, (millis() / 60) % 2);
         return;
     }
@@ -245,26 +272,38 @@ void loop() {
         ws.begin(SERVER_HOST, SERVER_PORT, SERVER_PATH);
     }
 
-    // PTT 按键(30ms 消抖)
+    // PTT 按键(30ms 消抖)+ 话权状态机
     static bool lastPressed = false;
     static uint32_t lastChange = 0;
     bool pressed = digitalRead(PTT_BTN_PIN) == LOW;
     if (pressed != lastPressed && millis() - lastChange > 30) {
         lastPressed = pressed;
         lastChange = millis();
-        if (pressed && wsOk) {
-            ringClear();
-            talking = true;
-            Serial.println("[PTT] 开始讲话");
-        } else if (!pressed) {
-            talking = false;
-            Serial.println("[PTT] 停止,开始回放");
+        if (pressed) {
+            if (!wsOk) {
+                Serial.println("[PTT] 服务器未连接");
+            } else if (pttState == PTT_IDLE) {
+                pttState = PTT_REQUESTING;
+                pttRequestAt = millis();
+                ws.sendTXT("{\"type\":\"ptt_request\"}");
+                Serial.println("[PTT] 申请话权…");
+            }
         } else {
-            Serial.println("[PTT] 服务器未连接");
+            if (pttState != PTT_IDLE) {
+                ws.sendTXT("{\"type\":\"ptt_release\"}");
+                Serial.println("[PTT] 释放话权");
+            }
+            pttState = PTT_IDLE;
         }
     }
 
-    if (talking) {
+    // 申请超时:松开重按即可重试
+    if (pttState == PTT_REQUESTING && millis() - pttRequestAt > PTT_REQUEST_TIMEOUT_MS) {
+        pttState = PTT_IDLE;
+        Serial.println("[PTT] 话权申请超时");
+    }
+
+    if (pttState == PTT_HOLDING) {
         size_t n = micReadFrame();
         if (wsOk && n > 0) ws.sendBIN((uint8_t *)pcmFrame, n);
     } else {
