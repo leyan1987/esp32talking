@@ -1,5 +1,8 @@
 #pragma once
 
+// 复制本文件为 config.h 并填入你的实际配置(config.h 已被 .gitignore 忽略,
+// 不会被提交到仓库,避免泄露 WiFi 密码)。
+
 // ==== WiFi ====
 #define WIFI_SSID     "你的WiFi名称"
 #define WIFI_PASSWORD "你的WiFi密码"
@@ -26,7 +29,7 @@
 #define FRAME_BYTES    (FRAME_SAMPLES * 2)              // 640 字节 PCM16/帧
 
 // 麦克风增益:右移位数。16=0dB,14=+12dB,12=+24dB,数值越小越响。
-// 默认 12(上一版 14 偏小)。若爆音改回 13/14;若仍偏小可试 11。
+// 默认 12。若爆音改回 13/14;若仍偏小可试 11。
 // 硬件上也可把 MAX98357A 的 GAIN 引脚接 GND(输出再 +3dB)。
 #define MIC_GAIN_SHIFT 12
 

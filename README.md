@@ -1,31 +1,116 @@
 # esp32talking
 
-小型可自部署的 ESP32 对讲机项目(C/S 架构),含安卓客户端与 Web 管理台。
+自建服务器的 ESP32 对讲机系统(C/S 架构):ESP32 硬件对讲机 + 安卓 App + Python 服务器 + Web 管理台,全部跑在你自己的局域网里,不依赖任何云服务。
 
-## 组成
+A self-hosted ESP32 walkie-talkie system: ESP32 intercom hardware, an Android app, a Python (FastAPI) server and a web admin console — everything runs on your own LAN.
 
-- `server/` — Python (FastAPI) 服务器:设备注册表(MAC/UUID)、群组、按当前群组路由语音、REST 管理接口、Web 管理台
-- `firmware/` — ESP32 固件(Arduino/PlatformIO):WiFi 接入、I2S 采集(INMP441)与播放(MAX98357A)、PTT 按键、WebSocket 长连接
-- `android/` — 安卓客户端(Kotlin/OkHttp):群组选择、改群组名、按住说话/松开收听
+[English](#features) | [中文文档](#功能特性)
 
-## 功能现状
+## 功能特性 / Features
 
-- ✅ 音频链路:16kHz/16bit PCM、20ms 一帧,局域网延迟约 100~200ms
-- ✅ 设备管理:首次连接自动注册(ESP32 按 MAC、安卓按 UUID),可改名/禁用/删除;禁用立即踢下线且无法重连
-- ✅ 群组:每个群组有 **6 位数字群号**,安卓可新建群组、凭群号加入;ESP32 在 `config.h` 里填群号自动加入(或由管理台拉人)
-- ✅ 多群组:设备可加入多个群组,每台设备有"当前群组",语音只路由给当前群组相同的在线成员
-- ✅ **话权控制(M3)**:同组同时只允许一人说话;按键先申请话权(先到先得),松开释放;**设备优先级 0~9,高者可抢占**;持话权 15 秒无音频自动释放;未授权音频被服务器丢弃
-- ✅ Web 管理台:浏览器打开 `http://<服务器IP>:8000/`,**登录后使用**(默认密码 `admin123`,请立即修改)
-- ✅ 安卓端:新建群组 / 群号加入 / 切换当前群组 / 群组改名 / 群成员在线状态 / 自改昵称 / 话权等待与抢占提示
-- ✅ **ADPCM 压缩(M3)**:IMA ADPCM 4:1,上行/下行带宽 32KB/s → **8KB/s**;帧头自带解码状态,丢帧不扩散;接收端按帧长自动识别新(ADPCM 164 字节)/旧(PCM 640 字节)格式;ESP32 播放缓冲等效时长 ×4(约 8 秒);语音 SNR 实测约 30dB
-- ✅ 安卓保活:前台服务 + CPU/WiFi 锁,灭屏、划掉 App 后仍保持在线
-- ✅ 设备身份与恢复码:每台设备有 **10 位恢复码**(连接后自动下发,管理台可查);恢复码同时写入手机公共 Downloads 文件,**升级/卸载重装后启动自动找回身份和历史群组**;ROM 重置标识符时也可在 App【设备码】手动输入旧码恢复
-- ✅ **文字消息**:安卓端可向当前群组发文字,首页显示消息与发送者昵称;服务器每群保留最近 50 条,**离线设备上线后自动补发**;ESP32 收到文字仅打印日志,不受影响
-- ⏳ M4(可选):多群组提示音、管理台美化、设备离线告警、WSS 加密
+- 🎙 **语音对讲**:16kHz/16bit PCM、20ms 一帧;**IMA ADPCM 压缩**(带宽 32KB/s → 8KB/s),语音 SNR ≈ 30dB
+- 📡 **多设备多群组**:设备可加入多个群组(6 位数字群号),语音按"当前群组"路由,同组实时互通、跨组隔离
+- 🔐 **话权控制**:同组同时只有一人说话;按 PTT 先申请话权(先到先得),支持**设备优先级(0~9)抢占**、15 秒无音频自动释放
+- 📱 **安卓客户端**:按住说话/松开收听、群组切换/新建/凭群号加入/改名、群成员在线状态、文字消息(离线补发)、自动响度均衡、前台服务保活(灭屏不掉线)
+- 🖥 **Web 管理台**:登录鉴权,设备自动注册(MAC/UUID)、改名/禁用/删除、建群拉人、切换群组、设置优先级
+- 🛡 **设备恢复码**:每台设备 10 位恢复码,重装 App / 换手机后凭码找回全部历史群组
+- 💬 **文字消息**:按当前群组群发,服务器保留最近 50 条,离线设备上线自动补发;ESP32 端自动忽略
 
-## 快速开始
+## 系统架构 / Architecture
 
-### 硬件接线(每台 ESP32 设备)
+```
+                    ┌──────────────────────────────┐
+                    │      服务器 (Python/FastAPI)   │
+                    │  ┌────────┐  ┌─────────────┐ │
+                    │  │ SQLite │  │  Web 管理台  │ │
+                    │  └────────┘  └─────────────┘ │
+                    │   设备注册表 / 群组 / 话权 / 消息 │
+                    └──────────┬───────────────────┘
+                               │ WebSocket (一条长连接)
+              ┌────────────────┼────────────────┐
+              │                │                │
+     ┌────────┴───────┐ ┌──────┴───────┐ ┌──────┴───────┐
+     │  ESP32 对讲机   │ │  ESP32 对讲机 │ │   安卓 App    │
+     │ INMP441 麦克风  │ │     ...      │ │ 按住说话/文字  │
+     │ MAX98357A 功放  │ │              │ │ 前台服务保活   │
+     └────────────────┘ └──────────────┘ └──────────────┘
+```
+
+- 二进制音频帧:ADPCM 164 字节 / 兼容旧版 PCM 640 字节,服务器原样转发
+- 控制消息:JSON 文本帧(注册、群组、话权、文字消息),协议详见 [README 协议速查](#协议速查websocket)
+
+## 目录结构
+
+```
+esp32talking/
+├── server/                 # Python 服务器(FastAPI + SQLite + Web 管理台)
+│   ├── server.py           # 主服务:WebSocket / REST / 话权 / 群组
+│   ├── static/admin.html   # Web 管理台(单文件)
+│   ├── test_server.py      # 自动化功能测试(21 项)
+│   └── start_server.bat    # Windows 一键启动
+├── firmware/               # ESP32 固件(PlatformIO / Arduino)
+│   ├── src/main.cpp        # I2S 采集播放 / ADPCM / 话权状态机
+│   └── src/config.h.example# 配置模板(复制为 config.h 使用)
+└── android/                # 安卓客户端(Kotlin,前台服务 + OkHttp)
+    └── app/src/main/.../   # TalkService(连接与音频)/ MainActivity(界面)
+```
+
+## 快速开始 / Quick Start
+
+### 1. 硬件清单(每台 ESP32 设备,约 30 元)
+
+- ESP32 开发板(推荐 ESP32-S3,经典 ESP32 亦可)
+- INMP441 I2S 数字麦克风
+- MAX98357A I2S 功放 + 3W 小喇叭
+- PTT 按键(GPIO4↔GND)+ 板载 LED(GPIO2)
+
+接线表见下文[硬件接线](#硬件接线每台-esp32-设备)。
+
+### 2. 启动服务器
+
+```bash
+cd server
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt   # Windows
+.venv\Scripts\python server.py                  # 监听 0.0.0.0:8000
+```
+
+- Web 管理台:`http://<服务器IP>:8000/`,默认密码 `admin123`,**登录后请立即修改**
+- 也可以双击 `server\start_server.bat`(Windows)
+
+### 3. 烧录 ESP32 固件
+
+1. 复制 `firmware/src/config.h.example` 为 `firmware/src/config.h`,填入 WiFi 与服务器 IP
+2. 用 VS Code PlatformIO 插件打开 `firmware/`,或命令行:
+   ```bash
+   pip install platformio
+   cd firmware && pio run -t upload && pio device monitor
+   ```
+
+### 4. 安卓客户端
+
+- 安装 [`android/app/build/outputs/apk/debug/app-debug.apk`](android/app/build/outputs/apk/debug/app-debug.apk)(需自行构建)或用 Android Studio 打开 `android/` 构建
+- 填服务器地址 `ws://<服务器IP>:8000/ws` → 连接 → 允许麦克风/通知权限
+- 群组操作都在 App 内:新建群组(自动分配 6 位群号)/ 群号加入 / 切换当前群组 / 改名
+
+### 验收:LED 常亮 = 就绪;两台设备加入同一群组,一边按住说话,另一边实时出声。
+
+<details>
+<summary><b>详细使用说明(数据存储 / 恢复码 / 调优 / 调试)</b></summary>
+
+- **数据存储**:所有数据(设备、群组、成员关系、昵称、恢复码、文字消息)都在 `server/esp32talking.db`(SQLite 单文件),备份该文件即可;删除等于全部重置
+- **恢复码**:每台设备 10 位恢复码,连接后自动下发;App【设备码】按钮可查看/复制(管理台设备列表也可查),恢复码同时写入手机 `Download/esp32talking_device_code.txt`。升级安装自动找回身份;卸载重装后自动读取该文件;极端情况点【设备码】手动输入旧码
+- **禁用/删除设备**:管理台操作,禁用立即踢下线且重连被拒
+- **话权优先级**:管理台设备表"优先级"列(0~9),数值高的申请话权时直接抢断低者
+- **音量调节**:固件 `config.h` 的 `MIC_GAIN_SHIFT`(16=0dB、14=+12dB、12=+24dB 默认,越小越响,爆音调大);App 内"音量"按钮软件增益 x1~x4;硬件可把 MAX98357A GAIN 接 GND 再 +3dB
+- **单机自环调试**(听到自己的回放,验证音频链路):
+  PowerShell: `$env:ESP32TALKING_ECHO="1"; .venv\Scripts\python server.py`
+- **自动化测试**:`.venv\Scripts\python test_server.py`(21 项,需全新数据库启动服务器)
+- **防火墙**:首次启动 Windows 弹窗请允许;手机/ESP32 与服务器需同一局域网
+
+</details>
+
+## 硬件接线(每台 ESP32 设备)
 
 | INMP441 麦克风 | ESP32 | | MAX98357A 功放 | ESP32 |
 |---|---|---|---|---|
@@ -36,68 +121,23 @@
 | SD | GPIO 32 | | DIN | GPIO 22 |
 | L/R | GND | | GAIN / SD | 悬空(音量小可把 GAIN 接 GND,+3dB) |
 
-按键:GPIO 4 ↔ GND。LED 用板载 GPIO 2。
+## 技术要点
 
-### 服务器
-
-```bash
-cd server
-python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt   # Windows
-.venv\Scripts\python server.py                  # 监听 0.0.0.0:8000
-.venv\Scripts\python test_server.py             # (可选)自动化功能测试
-```
-
-也可以双击 `server\start_server.bat` 启动。
-
-- 管理台:`http://<服务器IP>:8000/`,**需登录**(默认密码 `admin123`,登录后右上角"修改密码"立即更换;也可用环境变量 `ESP32TALKING_ADMIN` 设初始密码);管理台可新增设备、建群、拉成员、切当前群组、设置话权优先级、禁用/删除
-- 数据库:`server/esp32talking.db`(SQLite,可随时备份/删除重置)
-- 单机自环测试(听到自己的回放,仅调试用):
-  PowerShell: `$env:ESP32TALKING_ECHO="1"; .venv\Scripts\python server.py`
-
-### ESP32 固件
-
-1. 编辑 `firmware/src/config.h`,填入 WiFi 名称/密码、服务器 IP,以及要加入的 **6 位群号**(`JOIN_GROUP_CODE`,留空则由管理台手动拉入群组)
-2. VS Code 安装 PlatformIO 插件打开 `firmware/` 目录(或命令行 `pip install platformio` 后在 `firmware/` 下执行):
-   ```bash
-   pio run -t upload && pio device monitor
-   ```
-3. 音量调节(`config.h` 的 `MIC_GAIN_SHIFT`):16=0dB、14=+12dB、12=+24dB(当前默认),数值越小越响;爆音则调大
-4. `config.h` 的 `USE_ADPCM 1` 开启压缩(默认);排查问题时可改 0 回退裸 PCM。**注意:压缩需固件与安卓两端同时更新,旧版混用时音频无法正常播放**
-
-### 安卓客户端
-
-1. 安装 `android/app/build/outputs/apk/debug/app-debug.apk`,或用 Android Studio 打开 `android/` 自行构建
-2. 填服务器地址 `ws://<电脑IP>:8000/ws` → 连接 → 允许麦克风权限(通知权限建议允许)
-3. 群组操作:**新建群组**(创建后自动加入并切换,系统会报出 6 位群号)、**群号加入**(输入别人分享的 6 位号码)、**改名**;下拉框选择"当前群组"进行监听/通讯
-4. **成员**按钮可查看当前群组内谁的在线/离线(3 秒自动刷新)
-5. **改昵称**:修改自己在群组里的显示名(成员列表/管理台都会显示);昵称保存在服务器,重装不丢
-6. 连接后通知栏会出现常驻通知,这是保活机制——灭屏、划掉 App 后连接仍然保持;请勿强制停止应用,部分国产 ROM 需在设置里允许该应用"后台运行/自启动"
-
-### 数据存在哪里
-
-- **所有数据(设备、群组、成员关系、昵称、恢复码)都在服务器的 `server/esp32talking.db`**(SQLite 单文件),备份这个文件即可;删除它等于全部重置
-- 手机端不保存群组;设备身份由服务器分配 **10 位恢复码**并在连接时下发保存
-
-### 重装 App 后恢复群组(恢复码)
-
-1. 平时:App 里点【设备码】可见当前恢复码,截图/抄写保存(管理台设备列表也可查);恢复码同时会写入手机 `Download/esp32talking_device_code.txt`
-2. **升级安装**:App 数据保留,连接时自动凭恢复码找回身份,无需任何操作
-3. **卸载重装**:启动时自动读取 Downloads 里的恢复码文件找回身份;若文件丢失,点【设备码】输入旧码即可
-4. 恢复成功后 welcome 自动下发全部历史群组与离线文字消息
-
-> 注:安卓 6+ 拿不到稳定 WiFi MAC,客户端用持久化 UUID 作为设备 ID;管理台里可为其改名区分。
+- **音频链路**:I2S(INMP441 32bit 采集 / MAX98357A 16bit 播放)→ 20ms 帧 → IMA ADPCM(帧头自带解码状态,丢帧不扩散)→ WebSocket 二进制帧 → 对端按帧长自动识别解码
+- **性能**:ESP32 RAM 占用 35%,Flash 70%;局域网端到端延迟约 100~200ms
+- **长连接保活**:WebSocket ping/pong 心跳 + 断线自动重连(指数规避)+ 安卓前台服务 + CPU/WiFi 锁 + 进程被杀自愈重连
+- **音质调优**:采集端禁用 AGC(避免"越说越小"),播放端自动响度均衡(RMS 目标)叠加 1x~4x 手动增益,兼容不同 ROM 外放差异
 
 ## 协议速查(WebSocket)
 
-- 文本帧 JSON:`hello{id,kind,join_code?,recovery?}` → `welcome{device:{id,name,recovery_code},groups,active_group_id}`(recovery 能对上已有设备时找回身份;join_code 存在时自动入群);`create_group{name}` → `created{group_id,name}` + `groups{...}`;`join_group{code}` → `groups{...}`(群号错误回 `error`);`select_group{group_id}`、`list_groups` → `groups{...}`;`set_name{name}` → `device_info`;`rename_group{group_id,name}`(仅限自己所在群组)、`list_members{group_id}` → `members{...}`;被禁用收 `rejected{reason}` 后被断开
-- **话权(M3)**:`ptt_request` → `ptt_grant` 或 `ptt_deny{holder_name}`;`ptt_release` 释放;被抢占收 `ptt_revoke`;群内广播 `ptt_status{held,holder_name}`;未持话权的音频帧被服务器丢弃
-- **文字消息**:`chat{text}` 发到当前群组(≤200 字),持久化(每群留 50 条);在线成员实时收 `chat{group_id,from_name,text,ts}`,welcome/切群时补发 `chat_history{group_id,messages}`(最近 30 条)
-- 二进制帧:**ADPCM 164 字节**(M3,4 字节状态头 + 160 字节数据)或裸 PCM 640 字节(旧客户端兼容),接收端按帧长自动识别;服务器按发送方"当前群组"原样转发给同组其他在线成员,不回发给发送方
+- 文本帧 JSON:`hello{id,kind,join_code?,recovery?}` → `welcome{device:{id,name,recovery_code},groups,active_group_id}` + `chat_history{...}`;`create_group{name}` → `created{...}`;`join_group{code}` → `groups{...}`;`select_group` / `list_groups` → `groups{...}`;`set_name` → `device_info`;`rename_group` / `list_members` → `members{...}`;`ptt_request` → `ptt_grant` / `ptt_deny{holder_name}` / `ptt_revoke`;`ptt_release` / 群内广播 `ptt_status{held,holder_name}`;`chat{text}` → `chat{group_id,from_name,text,ts}`;被禁用收 `rejected{reason}` 后断开
+- 二进制帧:ADPCM 164 字节(4 字节状态头 + 160 字节数据)或兼容裸 PCM 640 字节,按"当前群组"转发,不回发发送方
 
-## 硬件清单(每台 ESP32 设备)
+## 开发状态
 
-- ESP32 开发板(推荐 ESP32-S3,M1 用经典 ESP32 即可)
-- INMP441 I2S 麦克风
-- MAX98357A I2S 功放 + 喇叭
-- PTT 按键 + 状态 LED
+- ✅ M1 音频链路 / M2 设备管理+群组+管理台 / M2.1 群号 / M2.2 保活+在线状态 / M2.3 昵称 / M2.4 恢复码 / M2.5 文字消息+文件持久化 / M3 话权控制+ADPCM
+- 🔜 计划中:端到端加密(WSS/TLS)、离线语音留言、多群组并行监听
+
+## 许可证
+
+[MIT](LICENSE)
