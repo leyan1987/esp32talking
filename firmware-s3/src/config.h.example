@@ -1,0 +1,52 @@
+#pragma once
+
+// 复制本文件为 config.h 并填入实际配置(config.h 已被 .gitignore 忽略,不会提交)
+// 适用于: LCDWIKI 2.8寸 ESP32-S3 模块 (ES3C28P / ES3N28P)
+
+// ==== WiFi ====
+#define WIFI_SSID     "你的WiFi名称"
+#define WIFI_PASSWORD "你的WiFi密码"
+
+// ==== 服务器 ====
+#define SERVER_HOST   "192.168.1.100"
+#define SERVER_PORT   8000
+#define SERVER_PATH   "/ws"
+
+// ==== 群组 ====
+// 填 6 位群号自动加入;留空 "" 则由管理台拉入
+#define JOIN_GROUP_CODE ""
+
+// ==== 音频 ====
+#define SAMPLE_RATE    16000
+#define FRAME_MS       20
+#define FRAME_SAMPLES  (SAMPLE_RATE * FRAME_MS / 1000)  // 320
+#define FRAME_BYTES    (FRAME_SAMPLES * 2)              // 640 PCM16
+#define USE_ADPCM      1   // 1=IMA ADPCM(164字节/帧) 0=裸 PCM(640字节/帧)
+
+// ES8311 采集增益寄存器值:0x01=0dB 0x02=6dB 0x03=12dB 0x04=18dB
+// 0x05=24dB 0x06=30dB 0x07=36dB 0x08=42dB(默认 18dB,过大易爆音)
+#define CODEC_MIC_GAIN_REG  0x04
+// ES8311 播放音量 0~100(内部对数映射到寄存器)
+#define CODEC_DAC_VOLUME    75
+
+// ==== I2S 引脚(板载定死,无需改动) ====
+#define I2S_MCLK_PIN 4
+#define I2S_BCLK_PIN 5
+#define I2S_DO_PIN   8    // ESP32 -> ES8311(播放)
+#define I2S_WS_PIN   7
+#define I2S_DI_PIN   6    // ES8311 -> ESP32(采集)
+
+// ==== 其他板载外设 ====
+#define PA_EN_PIN        1    // FM8002E 功放使能,低电平使能
+#define BOOT_KEY_PIN     0    // 板载 BOOT 按键,按住=低电平(当 PTT 用)
+#define CODEC_I2C_SDA    16
+#define CODEC_I2C_SCL    15
+#define CODEC_I2C_ADDR   0x18
+
+// ==== 液晶屏 (ILI9341V 240x320 SPI) ====
+#define LCD_PIN_CS   10
+#define LCD_PIN_MOSI 11
+#define LCD_PIN_SCLK 12
+#define LCD_PIN_MISO 13
+#define LCD_PIN_DC   46
+#define LCD_PIN_BL   45    // 高电平点亮

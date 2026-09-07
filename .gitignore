@@ -9,6 +9,7 @@ clangd/
 compile_commands.json
 # 真实配置含 WiFi 密码,不入库(模板见 config.h.example)
 firmware/src/config.h
+firmware-s3/src/config.h
 
 # ---- ESP-IDF ----
 build/

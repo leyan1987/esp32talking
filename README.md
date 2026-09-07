@@ -48,12 +48,24 @@ esp32talking/
 │   ├── static/admin.html   # Web 管理台(单文件)
 │   ├── test_server.py      # 自动化功能测试(21 项)
 │   └── start_server.bat    # Windows 一键启动
-├── firmware/               # ESP32 固件(PlatformIO / Arduino)
+├── firmware/               # ESP32 固件(经典 ESP32 + INMP441/MAX98357A 外设方案)
 │   ├── src/main.cpp        # I2S 采集播放 / ADPCM / 话权状态机
+│   └── src/config.h.example# 配置模板(复制为 config.h 使用)
+├── firmware-s3/            # ESP32-S3 一体板适配(LCDWIKI 2.8寸 ES3C28P/ES3N28P)
+│   ├── platformio.ini      # 16MB Flash + 8MB OPI PSRAM 配置
+│   ├── src/main.cpp        # ES8311 编解码(I2C)+ 半双工 I2S 切换 + ILI9341 屏显
+│   ├── src/es8311.h        # 自包含 ES8311 驱动(寄存器序列源自乐鑫 ESP-BSP)
 │   └── src/config.h.example# 配置模板(复制为 config.h 使用)
 └── android/                # 安卓客户端(Kotlin,前台服务 + OkHttp)
     └── app/src/main/.../   # TalkService(连接与音频)/ MainActivity(界面)
 ```
+
+### 已适配硬件
+
+| 板型 | 固件目录 | 音频方案 | 显示 |
+|---|---|---|---|
+| 经典 ESP32-WROOM 开发板 | `firmware/` | INMP441 麦克风 + MAX98357A 功放(外接) | 无(串口日志) |
+| LCDWIKI 2.8寸 ESP32-S3 模块(ES3C28P/ES3N28P,板载 ES8311 编解码 + 功放 + 硅麦 + ILI9341 触摸屏) | `firmware-s3/` | ES8311(I2C 0x18 初始化,I2S MCLK=4/BCLK=5/WS=7/DO=8/DI=6),BOOT 键作 PTT | ILI9341 屏显连接/群组/话权状态 |
 
 ## 快速开始 / Quick Start
 
