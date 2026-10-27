@@ -51,6 +51,12 @@
 
   <h2>设备管理 <small class="hint">ESP32 按 MAC、安卓按 UUID 自动注册;禁用后立即踢下线且无法重连;优先级高的话权可抢占</small></h2>
   <div class="row-form">
+    <label style="display:flex;align-items:center;gap:6px;font-size:14px;cursor:pointer">
+      <input type="checkbox" id="cbAutoReg" style="width:auto" onchange="toggleAutoReg(this.checked)">
+      允许新设备自动注册(白名单模式:关闭后只有此处预登记过的设备才能接入)
+    </label>
+  </div>
+  <div class="row-form">
     <input id="newDevId" placeholder="设备 ID / MAC,如 A4:CF:12:..">
     <input id="newDevName" placeholder="备注名(可选)">
     <button onclick="addDevice()">新增设备</button>
@@ -159,10 +165,20 @@ async function changePwd() {
 async function refresh() {
   if (!token) return;
   try {
-    const [d, g] = await Promise.all([api('GET', '/api/devices'), api('GET', '/api/groups')]);
+    const [d, g, s] = await Promise.all([
+      api('GET', '/api/devices'), api('GET', '/api/groups'), api('GET', '/api/settings'),
+    ]);
     devices = d.devices; groups = g.groups;
+    document.getElementById('cbAutoReg').checked = !!s.allow_auto_register;
     render();
   } catch (e) { if (e.message !== '未登录') toast('刷新失败: ' + e.message); }
+}
+
+async function toggleAutoReg(on) {
+  try {
+    await api('PATCH', '/api/settings', { allow_auto_register: on });
+    toast(on ? '已允许新设备自动注册' : '已开启白名单:未预登记设备将被拒绝');
+  } catch (e) { toast(e.message); refresh(); }
 }
 
 function el(tag, attrs, ...children) {

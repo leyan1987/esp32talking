@@ -159,6 +159,13 @@ python -m venv .venv
 - 文本帧 JSON:`hello{id,kind,join_code?,recovery?}` → `welcome{device:{id,name,recovery_code},groups,active_group_id}` + `chat_history{...}`;`create_group{name}` → `created{...}`;`join_group{code}` → `groups{...}`;`select_group` / `list_groups` → `groups{...}`;`set_name` → `device_info`;`rename_group` / `list_members` → `members{...}`;`ptt_request` → `ptt_grant` / `ptt_deny{holder_name}` / `ptt_revoke`;`ptt_release` / 群内广播 `ptt_status{held,holder_name}`;`chat{text}` → `chat{group_id,from_name,text,ts}`;被禁用收 `rejected{reason}` 后断开
 - 二进制帧:ADPCM 164 字节(4 字节状态头 + 160 字节数据)或兼容裸 PCM 640 字节,按"当前群组"转发,不回发发送方
 
+## 安全说明
+
+- **管理台**:登录鉴权(令牌 24 小时过期)、同 IP 连续 5 次密码错误锁定 10 分钟(可用环境变量 `ESP32TALKING_LOGIN_MAX_FAILS`/`ESP32TALKING_LOGIN_LOCKOUT` 调整)、常量时间密码比较;请务必修改默认密码
+- **设备接入**:默认自动注册;管理台可开启**白名单模式**(只允许预登记设备接入)。入群号连续错 5 次断开连接(防 6 位群号爆破);文字消息 10 条/10 秒限速;WS 单帧上限 1MB
+- **已知限制(局域网自部署的取舍)**:全链路为明文 WS/HTTP,管理台凭据与语音在局域网内可被嗅探;设备身份(MAC/UUID)由客户端自报,无密码学验证——恶意者若知道某设备 ID 可冒充它。计划中的改进:管理台 HTTPS、设备接入令牌(配网时下发、接入时校验)、端到端语音加密
+- **配网门户**仅在设备未配置/连接失败时开启,属物理临近攻击面,公共 WiFi 环境慎用
+
 ## 开发状态
 
 - ✅ M1 音频链路 / M2 设备管理+群组+管理台 / M2.1 群号 / M2.2 保活+在线状态 / M2.3 昵称 / M2.4 恢复码 / M2.5 文字消息+文件持久化 / M3 话权控制+ADPCM

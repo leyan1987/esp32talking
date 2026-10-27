@@ -35,6 +35,7 @@
 """
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -42,10 +43,11 @@ import random
 import sqlite3
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -121,17 +123,60 @@ def now() -> str:
 
 # ---------------- 管理台鉴权 ----------------
 
-auth_tokens: set[str] = set()
+TOKEN_TTL = 24 * 3600  # 登录令牌有效期(秒),过期需重新登录
+auth_tokens: dict[str, float] = {}  # token -> 签发时间
 ADMIN_DEFAULT_PASSWORD = os.environ.get("ESP32TALKING_ADMIN", "admin123")
+
+# 登录防爆破:同一来源 IP 连续失败 LOGIN_MAX_FAILS 次后锁定 LOGIN_LOCKOUT 秒
+LOGIN_MAX_FAILS = int(os.environ.get("ESP32TALKING_LOGIN_MAX_FAILS", "5"))
+LOGIN_LOCKOUT = int(os.environ.get("ESP32TALKING_LOGIN_LOCKOUT", "600"))
+login_fails: dict[str, list[float]] = {}  # ip -> 最近失败时间戳
+
+# WS 设备侧防滥用阈值
+JOIN_MAX_FAILS = 5   # 入群号连续失败次数上限(防 6 位群号爆破),超过即断开
+CHAT_RATE = 10       # 文字消息限速:每连接 10 秒窗口内最多条数,超速丢弃
 
 
 def admin_password() -> str:
-    row = db.execute("SELECT value FROM settings WHERE key='admin_password'").fetchone()
-    return row["value"] if row else ADMIN_DEFAULT_PASSWORD
+    return get_setting("admin_password", ADMIN_DEFAULT_PASSWORD)
+
+
+def get_setting(key: str, default: str) -> str:
+    row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    db.execute(
+        "INSERT INTO settings(key, value) VALUES(?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+    db.commit()
+
+
+def allow_auto_register() -> bool:
+    """设备白名单开关:关闭后,未在管理台预登记的设备将被拒绝接入。"""
+    return get_setting("allow_auto_register", "1") == "1"
+
+
+def login_locked(ip: str) -> int:
+    """返回剩余锁定秒数;0 表示未锁定。"""
+    fails = [t for t in login_fails.get(ip, []) if time.time() - t < LOGIN_LOCKOUT]
+    login_fails[ip] = fails
+    if len(fails) >= LOGIN_MAX_FAILS:
+        return int(LOGIN_LOCKOUT - (time.time() - fails[0])) + 1
+    return 0
+
+
+def login_record_fail(ip: str) -> None:
+    login_fails.setdefault(ip, []).append(time.time())
 
 
 async def auth_guard(x_auth_token: str | None = Header(default=None)):
-    if x_auth_token not in auth_tokens:
+    ts = auth_tokens.get(x_auth_token or "")
+    if ts is None or time.time() - ts > TOKEN_TTL:
+        auth_tokens.pop(x_auth_token or "", None)
         raise HTTPException(401, "未登录或登录已过期")
 
 
@@ -212,7 +257,9 @@ class Conn:
     active_group_id: int | None = None
     member_groups: set[int] = field(default_factory=set)
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    audio_drops: int = 0  # 未持话权被丢弃的音频帧计数
+    audio_drops: int = 0          # 未持话权被丢弃的音频帧计数
+    join_fails: int = 0           # 入群号失败次数(防爆破)
+    chat_times: deque = field(default_factory=deque)  # 聊天限速滑动窗口
 
 
 conns: dict[str, Conn] = {}          # conn_id -> Conn
@@ -311,6 +358,17 @@ async def ws_endpoint(ws: WebSocket) -> None:
             if dev is not None:
                 log.info("设备凭恢复码找回身份: %s (上报 id %s)", dev["id"], device_id)
         if dev is None:
+            # 白名单模式:管理员关闭自动注册后,未知设备一律拒绝
+            if not allow_auto_register():
+                await ws.send_text(
+                    json.dumps(
+                        {"type": "rejected", "reason": "设备未注册(服务器已开启白名单)"},
+                        ensure_ascii=False,
+                    )
+                )
+                log.info("拒绝未注册设备: %s (自动注册已关闭)", device_id)
+                await ws.close(code=1008)
+                return
             db.execute(
                 "INSERT INTO devices(id, name, recovery_code, last_seen) VALUES(?, ?, ?, ?)",
                 (device_id, f"设备-{device_id[-4:]}", rec or gen_recovery(), now()),
@@ -460,7 +518,16 @@ async def handle_text(conn: Conn, text: str) -> None:
             await send_chat_history(conn, gid)
 
     elif t == "chat":
-        # 文字消息:发到当前群组,持久化,在线成员实时收,离线成员上线补发
+        # 文字消息:发到当前群组,持久化,在线成员实时收,离线成员上线补发。
+        # 限速:每连接 10 秒窗口内最多 CHAT_RATE 条,超速静默丢弃(防刷屏 DoS)
+        now_ts = time.time()
+        times = conn.chat_times
+        while times and now_ts - times[0] > 10:
+            times.popleft()
+        if len(times) >= CHAT_RATE:
+            log.warning("设备 %s 聊天超速(>%d/10s),丢弃", conn.device_id, CHAT_RATE)
+            return
+        times.append(now_ts)
         text = str(obj.get("text", "")).strip()[:200]
         gid = conn.active_group_id
         if not text or gid is None or gid not in conn.member_groups:
@@ -508,12 +575,24 @@ async def handle_text(conn: Conn, text: str) -> None:
         log.info("设备 %s 创建群组 %d (%s)", conn.device_id, gid, name)
 
     elif t == "join_group":
-        # 凭 6 位群号加入群组
+        # 凭 6 位群号加入群组(防爆破:连续失败 JOIN_MAX_FAILS 次直接断开)
         code = str(obj.get("code", "")).strip()
         g = find_group_by_code(code)
         if g is None:
+            conn.join_fails += 1
+            if conn.join_fails >= JOIN_MAX_FAILS:
+                await ws_send_json(
+                    conn, {"type": "rejected", "reason": "群号尝试次数过多,连接已断开"}
+                )
+                log.warning("设备 %s 疑似群号爆破(连续 %d 次失败),断开", conn.device_id, conn.join_fails)
+                try:
+                    await conn.ws.close(code=1008)
+                except Exception:
+                    pass
+                return
             await ws_send_json(conn, {"type": "error", "message": f"群号 {code} 不存在"})
             return
+        conn.join_fails = 0
         db.execute(
             "INSERT OR IGNORE INTO group_members(group_id, device_id) VALUES(?, ?)",
             (g["id"], conn.device_id),
@@ -672,37 +751,55 @@ async def admin_page():
 
 
 @app.post("/api/login")
-async def login(body: dict):
-    if str(body.get("password", "")) != admin_password():
+async def login(body: dict, request: Request):
+    ip = request.client.host if request.client else "?"
+    remain = login_locked(ip)
+    if remain > 0:
+        log.warning("登录尝试被限流: %s (剩余 %ds)", ip, remain)
+        raise HTTPException(429, f"尝试次数过多,请 {remain} 秒后重试")
+    if not hmac.compare_digest(str(body.get("password", "")), admin_password()):
+        login_record_fail(ip)
+        log.warning("管理台登录失败: %s", ip)
         raise HTTPException(401, "密码错误")
+    login_fails.pop(ip, None)
     token = uuid.uuid4().hex
-    auth_tokens.add(token)
+    auth_tokens[token] = time.time()
     log.info("管理台登录成功")
     return {"token": token, "default_password": admin_password() == "admin123"}
 
 
 @app.post("/api/logout")
 async def logout(x_auth_token: str | None = Header(default=None)):
-    auth_tokens.discard(x_auth_token or "")
+    auth_tokens.pop(x_auth_token or "", None)
     return {"ok": True}
 
 
-@app.post("/api/password")
-async def change_password(body: dict, x_auth_token: str | None = Header(default=None)):
-    if x_auth_token not in auth_tokens:
-        raise HTTPException(401, "未登录或登录已过期")
+@app.post("/api/password", dependencies=[Depends(auth_guard)])
+async def change_password(body: dict):
     old, new = str(body.get("old", "")), str(body.get("new", ""))
-    if old != admin_password():
+    if not hmac.compare_digest(old, admin_password()):
         raise HTTPException(400, "旧密码错误")
     if len(new) < 6:
         raise HTTPException(400, "新密码至少 6 位")
-    db.execute(
-        "INSERT INTO settings(key, value) VALUES('admin_password', ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (new,),
-    )
-    db.commit()
+    set_setting("admin_password", new)
     log.info("管理台密码已修改")
+    return {"ok": True}
+
+
+@app.get("/api/settings", dependencies=[Depends(auth_guard)])
+async def get_settings():
+    return {
+        "allow_auto_register": allow_auto_register(),
+        "default_password": admin_password() == "admin123",
+    }
+
+
+@app.patch("/api/settings", dependencies=[Depends(auth_guard)])
+async def patch_settings(body: dict):
+    if "allow_auto_register" in body:
+        on = bool(body["allow_auto_register"])
+        set_setting("allow_auto_register", "1" if on else "0")
+        log.info("设备自动注册(白名单)开关: %s", "开启" if on else "关闭")
     return {"ok": True}
 
 
@@ -717,7 +814,7 @@ async def add_device(body: dict):
     dev_id = str(body.get("id", "")).strip().upper()
     if not dev_id:
         raise HTTPException(400, "缺少设备 id(MAC 或 UUID)")
-    name = str(body.get("name") or f"设备-{dev_id[-4:]}")
+    name = str(body.get("name") or f"设备-{dev_id[-4:]}").strip()[:20]
     if db.execute("SELECT 1 FROM devices WHERE id = ?", (dev_id,)).fetchone():
         raise HTTPException(409, "设备已存在")
     db.execute("INSERT INTO devices(id, name, last_seen) VALUES(?, ?, ?)", (dev_id, name, now()))
@@ -735,7 +832,7 @@ async def patch_device(device_id: str, body: dict):
 
     if "name" in body:
         updates.append("name = ?")
-        args.append(str(body["name"]))
+        args.append(str(body["name"]).strip()[:20])
     if "priority" in body:
         p = body["priority"]
         if not isinstance(p, int) or not (0 <= p <= 9):
@@ -818,7 +915,7 @@ async def list_groups():
 
 @app.post("/api/groups", dependencies=[Depends(auth_guard)])
 async def create_group(body: dict):
-    name = str(body.get("name", "")).strip()
+    name = str(body.get("name", "")).strip()[:20]
     if not name:
         raise HTTPException(400, "群组名不能为空")
     gid = allocate_group_id()
@@ -829,7 +926,7 @@ async def create_group(body: dict):
 
 @app.patch("/api/groups/{group_id}", dependencies=[Depends(auth_guard)])
 async def rename_group(group_id: int, body: dict):
-    name = str(body.get("name", "")).strip()
+    name = str(body.get("name", "")).strip()[:20]
     if not name:
         raise HTTPException(400, "群组名不能为空")
     if db.execute("SELECT 1 FROM groups WHERE id = ?", (group_id,)).fetchone() is None:
@@ -937,4 +1034,6 @@ async def start_floor_sweeper():
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # ws_max_size: 单条 WS 消息上限 1MB(正常音频帧 164B/640B, 控制消息 KB 级),
+    # 超大帧直接断开, 防止恶意客户端用巨帧打满内存
+    uvicorn.run(app, host="0.0.0.0", port=8000, ws_max_size=1 << 20)

@@ -351,6 +351,75 @@ async def main() -> int:
         assert "esp32talking 管理台" in html and "loginView" in html
     print("12. 管理页(含登录) OK")
 
+    # 13) 设置接口 + 白名单(自动注册)开关
+    st = api("GET", "/settings")
+    assert st["allow_auto_register"] is True, st
+    api("PATCH", "/settings", {"allow_auto_register": False})
+    async with websockets.connect(URI) as wx:
+        await wx.send(json.dumps({"type": "hello", "id": "TEST-NOT-REG"}))
+        rej = await recv_of_type(wx, "rejected")
+        assert "未注册" in rej["reason"], rej
+    api("PATCH", "/settings", {"allow_auto_register": True})
+    async with websockets.connect(URI) as wx:
+        wl = await hello_device(wx, "TEST-NOT-REG")
+        assert wl["type"] == "welcome"
+    print("13. 白名单开关(拒绝未注册/恢复注册) OK")
+
+    # 14) 名称长度上限(防滥用超长字段)
+    api("PATCH", f"/devices/{D1}", {"name": "X" * 50})
+    devs = api("GET", "/devices")["devices"]
+    assert len(next(d for d in devs if d["id"] == D1)["name"]) == 20
+    api("PATCH", f"/devices/{D1}", {"name": "老王的手机"})  # 恢复
+    print("14. 名称长度上限 OK")
+
+    # 15) 入群号防爆破:连续 5 次失败断开
+    async with websockets.connect(URI) as wx:
+        await hello_device(wx, D3)
+        for i in range(4):
+            await wx.send(json.dumps({"type": "join_group", "code": "111111"}))
+            await recv_of_type(wx, "error")
+        await wx.send(json.dumps({"type": "join_group", "code": "222222"}))
+        rej = await recv_of_type(wx, "rejected")
+        assert "尝试次数过多" in rej["reason"], rej
+        try:
+            await asyncio.wait_for(wx.recv(), 5)
+            closed = False
+        except (websockets.ConnectionClosed, asyncio.TimeoutError):
+            closed = True
+        assert closed, "爆破防护未断开连接"
+    print("15. 入群号防爆破(5 次失败断开) OK")
+
+    # 16) 聊天限速:10 秒窗口内第 11 条起丢弃
+    async with websockets.connect(URI) as wx:
+        await hello_device(wx, D3)
+        for i in range(15):
+            await wx.send(json.dumps({"type": "chat", "text": f"spam{i}"}))
+        got = 0
+        try:
+            while True:
+                m = await recv_of_type(wx, "chat", timeout=2)
+                got += 1
+        except asyncio.TimeoutError:
+            pass
+        assert got == 10, f"聊天限速异常: 收到 {got}/15"
+    print("16. 聊天限速(10 条/10 秒) OK")
+
+    # 17) 登录防爆破(放最后:失败会锁定本机 IP 的 /api/login 10 分钟)
+    codes = []
+    for i in range(6):
+        req = urllib.request.Request(
+            API + "/login", data=json.dumps({"password": "wrong"}).encode(),
+            method="POST", headers={"Content-Type": "application/json"},
+        )
+        try:
+            urllib.request.urlopen(req)
+            codes.append(200)
+        except urllib.error.HTTPError as e:
+            codes.append(e.code)
+    assert codes[:5] == [401] * 5, codes
+    assert codes[5] == 429, codes
+    print("17. 登录防爆破(5 次失败后 429 限流) OK")
+
     print("全部测试通过 ✔")
     return 0
 
