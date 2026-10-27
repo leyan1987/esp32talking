@@ -50,11 +50,15 @@ esp32talking/
 │   └── start_server.bat    # Windows 一键启动
 ├── firmware/               # ESP32 固件(经典 ESP32 + INMP441/MAX98357A 外设方案)
 │   ├── src/main.cpp        # I2S 采集播放 / ADPCM / 话权状态机
+│   ├── src/config_store.h  # NVS 配置存储(配网值优先,config.h 为出厂默认)
+│   ├── src/provisioning.h  # 免编译配网门户(AP 热点 + 网页配置)
 │   └── src/config.h.example# 配置模板(复制为 config.h 使用)
 ├── firmware-s3/            # ESP32-S3 一体板适配(LCDWIKI 2.8寸 ES3C28P/ES3N28P)
 │   ├── platformio.ini      # 16MB Flash + 8MB OPI PSRAM 配置
-│   ├── src/main.cpp        # ES8311 编解码(I2C)+ 半双工 I2S 切换 + ILI9341 屏显
+│   ├── src/main.cpp        # ES8311 编解码 + 半双工 I2S + 触摸键盘/PTT 界面
 │   ├── src/es8311.h        # 自包含 ES8311 驱动(寄存器序列源自乐鑫 ESP-BSP)
+│   ├── src/ft6336.h        # FT6336G 电容触摸驱动(与 ES8311 共用 I2C)
+│   ├── src/config_store.h / provisioning.h  # 同上(共享拷贝)
 │   └── src/config.h.example# 配置模板(复制为 config.h 使用)
 └── android/                # 安卓客户端(Kotlin,前台服务 + OkHttp)
     └── app/src/main/.../   # TalkService(连接与音频)/ MainActivity(界面)
@@ -90,14 +94,24 @@ python -m venv .venv
 - Web 管理台:`http://<服务器IP>:8000/`,默认密码 `admin123`,**登录后请立即修改**
 - 也可以双击 `server\start_server.bat`(Windows)
 
-### 3. 烧录 ESP32 固件
+### 3. 烧录 ESP32 固件(免编译配网)
 
-1. 复制 `firmware/src/config.h.example` 为 `firmware/src/config.h`,填入 WiFi 与服务器 IP
-2. 用 VS Code PlatformIO 插件打开 `firmware/`,或命令行:
+1. 复制对应工程的 `src/config.h.example` 为 `src/config.h`(**可不填**,留占位值即可——配网值会覆盖它)
+2. 用 VS Code PlatformIO 插件打开工程目录(`firmware/` 或 `firmware-s3/`),或命令行:
    ```bash
    pip install platformio
-   cd firmware && pio run -t upload && pio device monitor
+   cd firmware && pio run -t upload && pio device monitor      # 经典 ESP32
+   cd firmware-s3 && pio run -e es3n28p -t upload              # S3 一体板
    ```
+
+**首次上电自动进入配网**(WiFi 连不上时也会进入):
+
+1. 手机连接设备热点 `esp32talking-XXXX`(无密码;手机提示"无法上网"属正常)
+2. 自动弹出配置页(或浏览器访问 `http://192.168.4.1`),填写 **WiFi 名称/密码、服务器 IP/端口、群号** → 保存,设备自动重启上线
+3. 之后改 WiFi/服务器无需重新烧录:重新进入配网即可——
+   - 经典版:**按住 PTT 键上电 3 秒**清除配置
+   - S3 版:点屏幕右下角 **SETUP** 按钮(触摸屏也可直接用数字键盘输入 6 位群号加入群组,立即生效并保存)
+4. `config.h` 里的值仅在设备从未配网时生效(作为出厂默认)
 
 ### 4. 安卓客户端
 

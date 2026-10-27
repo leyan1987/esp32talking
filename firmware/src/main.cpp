@@ -17,6 +17,8 @@
 #include <WebSocketsClient.h>
 
 #include "config.h"
+#include "config_store.h"
+#include "provisioning.h"
 
 static WebSocketsClient ws;
 static bool wifiOk = false;
@@ -265,8 +267,8 @@ static void onWsEvent(WStype_t type, uint8_t *payload, size_t len) {
             // hello:服务器按 MAC 识别设备;join_code 让服务器自动把本机拉进群组
             String hello = String("{\"type\":\"hello\",\"mac\":\"") +
                            WiFi.macAddress() + "\",\"proto\":1";
-            if (strlen(JOIN_GROUP_CODE) > 0) {
-                hello += String(",\"join_code\":\"") + JOIN_GROUP_CODE + "\"";
+            if (cfg.groupCode.length() == 6) {
+                hello += String(",\"join_code\":\"") + cfg.groupCode + "\"";
             }
             hello += "}";
             ws.sendTXT(hello);
@@ -323,6 +325,25 @@ static void ledUpdate() {
     digitalWrite(STATUS_LED_PIN, (millis() % period) < period / 2);
 }
 
+// 配网模式下的 LED 呈现(由 provisioning.h 每秒调用一次)
+static uint32_t portalBlinkMs = 0;
+static bool portalBlinkState = false;
+
+void provisioningUiTick() {
+    if (millis() - portalBlinkMs >= 60) {
+        portalBlinkMs = millis();
+        portalBlinkState = !portalBlinkState;
+        digitalWrite(STATUS_LED_PIN, portalBlinkState);
+    }
+    static uint32_t lastLog = 0;
+    if (millis() - lastLog >= 10000) {
+        lastLog = millis();
+        Serial.printf("[配网] AP: %s  已连接设备: %d  配置页: http://%s/\n",
+                      provisioningApSsid().c_str(), provisioningStations(),
+                      WiFi.softAPIP().toString().c_str());
+    }
+}
+
 // ---------- 主流程 ----------
 void setup() {
     Serial.begin(115200);
@@ -330,21 +351,56 @@ void setup() {
     pinMode(STATUS_LED_PIN, OUTPUT);
     digitalWrite(STATUS_LED_PIN, LOW);
 
-    micInit();
-    spkInit();
+    // 长按 PTT 上电 3 秒:清除已保存配置(重启后进入配网模式)
+    if (digitalRead(PTT_BTN_PIN) == LOW) {
+        uint32_t t0 = millis();
+        while (digitalRead(PTT_BTN_PIN) == LOW && millis() - t0 < 3000) delay(20);
+        if (digitalRead(PTT_BTN_PIN) == LOW) {
+            Serial.println("[配网] 检测到开机长按键,清除已保存配置");
+            configClear();
+        }
+    }
+
+    configLoad();
+    Serial.printf("[启动] MAC: %s\n", WiFi.macAddress().c_str());
+    Serial.printf("[配置] SSID=%s 服务器=%s:%u 群号=%s (来源: %s)\n",
+                  cfg.ssid.c_str(), cfg.host.c_str(), cfg.port,
+                  cfg.groupCode.length() ? cfg.groupCode.c_str() : "(无)",
+                  cfg.provisioned() ? "配网页面" : "编译默认");
 
     WiFi.persistent(false);
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);  // 关闭省电模式,降低音频延迟抖动
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    WiFi.begin(cfg.ssid.c_str(), cfg.pass.c_str());
 
-    ws.begin(SERVER_HOST, SERVER_PORT, SERVER_PATH);
+    Serial.println("[WiFi] 连接中(最多 15 秒)…");
+    uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+        digitalWrite(STATUS_LED_PIN, (millis() / 120) % 2);
+        delay(40);
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[WiFi] 连接失败,进入配网模式");
+        provisioningStart();
+        return;  // loop() 将只运行配网
+    }
+
+    Serial.printf("[WiFi] 已连接, IP: %s\n", WiFi.localIP().toString().c_str());
+    wifiOk = true;
+
+    micInit();
+    spkInit();
+
+    ws.begin(cfg.host.c_str(), cfg.port, SERVER_PATH);
     ws.onEvent(onWsEvent);
-
-    Serial.printf("[启动] MAC: %s, 固件: M1\n", WiFi.macAddress().c_str());
+    Serial.printf("[服务器] %s:%u%s\n", cfg.host.c_str(), cfg.port, SERVER_PATH);
 }
 
 void loop() {
+    if (provisioningActive()) {
+        provisioningLoop();
+        return;
+    }
     ws.loop();
     ledUpdate();
 
@@ -368,7 +424,7 @@ void loop() {
     if (wifiOk && !wsOk && millis() - lastWsTry > 5000) {
         lastWsTry = millis();
         ws.disconnect();
-        ws.begin(SERVER_HOST, SERVER_PORT, SERVER_PATH);
+        ws.begin(cfg.host.c_str(), cfg.port, SERVER_PATH);
     }
 
     // PTT 按键(30ms 消抖)+ 话权状态机

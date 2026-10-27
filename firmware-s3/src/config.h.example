@@ -2,18 +2,21 @@
 
 // 复制本文件为 config.h 并填入实际配置(config.h 已被 .gitignore 忽略,不会提交)
 // 适用于: LCDWIKI 2.8寸 ESP32-S3 模块 (ES3C28P / ES3N28P)
+//
+// 注意:下列 WiFi/服务器/群号为"出厂默认值"——设备首次配网后,以配网页面
+// (或屏幕键盘)保存进设备存储的配置为准;屏幕右下角"配网"按钮可重置。
 
-// ==== WiFi ====
+// ==== WiFi(出厂默认) ====
 #define WIFI_SSID     "你的WiFi名称"
 #define WIFI_PASSWORD "你的WiFi密码"
 
-// ==== 服务器 ====
+// ==== 服务器(出厂默认) ====
 #define SERVER_HOST   "192.168.1.100"
 #define SERVER_PORT   8000
 #define SERVER_PATH   "/ws"
 
-// ==== 群组 ====
-// 填 6 位群号自动加入;留空 "" 则由管理台拉入
+// ==== 群组(出厂默认) ====
+// 填 6 位群号自动加入;留空 "" 则由管理台拉入或在屏幕键盘输入
 #define JOIN_GROUP_CODE ""
 
 // ==== 音频 ====
@@ -50,3 +53,17 @@
 #define LCD_PIN_MISO 13
 #define LCD_PIN_DC   46
 #define LCD_PIN_BL   45    // 高电平点亮
+
+// ==== 触摸 (板载电容触摸 FT5x06 / FT6336G, I2C 0x38, 与 ES8311 同总线) ====
+// 与 ES8311 编解码共用 SDA/SCL(16/15),设为 0 可关闭触摸(退回仅 BOOT 键 PTT)
+#define TOUCH_ENABLED  1
+#define TP_SDA   16    // = CODEC_I2C_SDA
+#define TP_SCL   15    // = CODEC_I2C_SCL
+#define TP_I2C_ADDR   0x38
+#define TP_RST_PIN    18
+#define TP_INT_PIN    17
+
+// 触摸方向与屏幕不一致时翻转(先试默认,不对再改,重新烧录即可):
+#define TOUCH_SWAP_XY  0    // 1=X/Y 轴互换
+#define TOUCH_MIRROR_X 0    // 1=左右镜像
+#define TOUCH_MIRROR_Y 0    // 1=上下镜像

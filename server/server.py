@@ -436,6 +436,13 @@ async def handle_text(conn: Conn, text: str) -> None:
 
     if t == "select_group":
         gid = obj.get("group_id")
+        # 兼容固件/客户端凭 6 位群号切换当前群组(除 group_id 外新增 code 入参)
+        if not isinstance(gid, int):
+            code = str(obj.get("code", "")).strip()
+            if code:
+                g = find_group_by_code(code)
+                if g is not None and g["id"] in conn.member_groups:
+                    gid = g["id"]
         if isinstance(gid, int) and gid in conn.member_groups:
             conn.active_group_id = gid
             db.execute(
