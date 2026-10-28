@@ -49,7 +49,8 @@ esp32talking/
 │   ├── test_server.py      # 自动化功能测试(21 项)
 │   └── start_server.bat    # Windows 一键启动
 ├── firmware/               # ESP32 固件(经典 ESP32 + INMP441/MAX98357A 外设方案)
-│   ├── src/main.cpp        # I2S 采集播放 / ADPCM / 话权状态机
+│   ├── src/main.cpp        # I2S 采集播放 / 话权状态机(精简后)
+│   ├── src/adpcm.h         # IMA ADPCM 编解码(与 S3 版同构)
 │   ├── src/config_store.h  # NVS 配置存储(配网值优先,config.h 为出厂默认)
 │   ├── src/provisioning.h  # 免编译配网门户(AP 热点 + 网页配置)
 │   └── src/config.h.example# 配置模板(复制为 config.h 使用)
@@ -57,7 +58,6 @@ esp32talking/
 │   ├── platformio.ini      # 16MB Flash + 8MB OPI PSRAM 配置
 │   ├── src/main.cpp        # ES8311 编解码 + 半双工 I2S + 触摸键盘/PTT 界面
 │   ├── src/es8311.h        # 自包含 ES8311 驱动(寄存器序列源自乐鑫 ESP-BSP)
-│   ├── src/ft6336.h        # FT6336G 电容触摸驱动(与 ES8311 共用 I2C)
 │   ├── src/config_store.h / provisioning.h  # 同上(共享拷贝)
 │   └── src/config.h.example# 配置模板(复制为 config.h 使用)
 └── android/                # 安卓客户端(Kotlin,前台服务 + OkHttp)

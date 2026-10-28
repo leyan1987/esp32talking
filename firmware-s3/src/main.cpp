@@ -18,7 +18,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <esp_wifi.h>
+#include <esp_err.h>
 #include <Wire.h>
 #include <driver/i2s.h>
 #include <WebSocketsClient.h>
@@ -201,7 +201,16 @@ static bool pttTouchHeld = false;  // 触摸 PTT 区域是否正被按住
 
 // ---------- 播放环形缓冲(帧感知:2字节长度前缀) ----------
 #define RING_SIZE (96 * 1024)
-static uint8_t ringBuf[RING_SIZE];
+// 缓冲放 PSRAM:8MB OPI 富余,省出 96KB 宝贵的内部 RAM(DMA 不经过此缓冲,无性能影响)
+static uint8_t *ringBuf = nullptr;
+
+static void ringAlloc() {
+    ringBuf = (uint8_t *)heap_caps_malloc(RING_SIZE, MALLOC_CAP_SPIRAM);
+    if (ringBuf == nullptr) {
+        ringBuf = (uint8_t *)malloc(RING_SIZE);  // PSRAM 不可用时回退内部 RAM
+        Serial.println("[audio] WARNING: PSRAM alloc failed, using internal RAM");
+    }
+}
 static size_t ringHead = 0;
 static size_t ringTail = 0;
 static uint32_t droppedFrames = 0;
@@ -674,6 +683,7 @@ void setup() {
     lcd.setRotation(0);
     pinMode(LCD_PIN_BL, OUTPUT);
     digitalWrite(LCD_PIN_BL, HIGH);
+    ringAlloc();
     uiRender();
 
     // 加载配置(NVS 优先,回退编译期默认)
@@ -721,6 +731,7 @@ void setup() {
 
     ws.begin(cfg.host.c_str(), cfg.port, SERVER_PATH);
     ws.onEvent(onWsEvent);
+    ws.enableHeartbeat(15000, 3000, 2);  // 心跳:空闲时 ping/pong 探测死连接
 
     Serial.printf("[服务器] %s:%u%s\n", cfg.host.c_str(), cfg.port, SERVER_PATH);
     Serial.printf("[boot] firmware: S3-ES3 v1.2 (portal + touch UI)\n");

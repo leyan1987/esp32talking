@@ -161,6 +161,7 @@ class TalkService : Service() {
     private var serverUrl: String? = null
     private var userClosed = false
     private var reconnectScheduled = false
+    private var reconnectRunnable: Runnable? = null
     private var statusText = "未连接"
     private var foreground = false
 
@@ -225,6 +226,36 @@ class TalkService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
+
+    /** 用户主动退出:取消重连定时器、彻底断开、停掉前台服务与通知 */
+    fun exitApp() {
+        userClosed = true
+        reconnectRunnable?.let { ui.removeCallbacks(it) }
+        reconnectRunnable = null
+        reconnectScheduled = false
+        stopTalkingInternal()
+        ws?.close(1000, "bye")
+        ws = null
+        releaseLocks()
+        stopForegroundAndNotification()
+        stopSelf()
+    }
+
+    /** 用户从最近任务划掉 App:魅族等激进 ROM 会连前台服务一起杀,1 秒后自杀重启自愈 */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        if (userClosed) return  // 用户主动退出则不重启
+        val restart = Intent(applicationContext, TalkService::class.java)
+        val pi = android.app.PendingIntent.getService(
+            applicationContext, 1, restart,
+            android.app.PendingIntent.FLAG_ONE_SHOT or android.app.PendingIntent.FLAG_IMMUTABLE
+        )
+        val am = getSystemService(ALARM_SERVICE) as android.app.AlarmManager
+        am.setExactAndAllowWhileIdle(
+            android.app.AlarmManager.ELAPSED_REALTIME_WAKEUP,
+            android.os.SystemClock.elapsedRealtime() + 1000, pi
+        )
+    }
 
     override fun onDestroy() {
         super.onDestroy()
@@ -426,10 +457,11 @@ class TalkService : Service() {
                 setStatus("$msg,5 秒后重连")
                 if (!reconnectScheduled) {
                     reconnectScheduled = true
-                    ui.postDelayed({
+                    reconnectRunnable = Runnable {
                         reconnectScheduled = false
                         serverUrl?.let { connect(it) }
-                    }, 5000)
+                    }
+                    ui.postDelayed(reconnectRunnable!!, 5000)
                 }
             } else {
                 setStatus("未连接")

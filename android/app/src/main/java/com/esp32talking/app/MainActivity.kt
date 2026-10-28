@@ -55,6 +55,7 @@ class MainActivity : Activity() {
     private lateinit var btnMyName: Button
     private lateinit var btnGain: Button
     private lateinit var btnDevCode: Button
+    private lateinit var btnExit: Button
     private lateinit var scrollMessages: android.widget.ScrollView
     private lateinit var llMessages: LinearLayout
     private lateinit var etChat: EditText
@@ -161,6 +162,7 @@ class MainActivity : Activity() {
         btnMyName = findViewById(R.id.btnMyName)
         btnGain = findViewById(R.id.btnGain)
         btnDevCode = findViewById(R.id.btnDevCode)
+        btnExit = findViewById(R.id.btnExit)
         scrollMessages = findViewById(R.id.scrollMessages)
         llMessages = findViewById(R.id.llMessages)
         etChat = findViewById(R.id.etChat)
@@ -226,6 +228,9 @@ class MainActivity : Activity() {
         btnDevCode.setOnClickListener {
             showDeviceCodeDialog()
         }
+        btnExit.setOnClickListener {
+            showExitDialog()
+        }
         btnSend.setOnClickListener {
             val text = etChat.text.toString().trim()
             if (text.isEmpty()) return@setOnClickListener
@@ -284,6 +289,35 @@ class MainActivity : Activity() {
             .setAction(TalkService.ACTION_CONNECT)
             .putExtra(TalkService.EXTRA_URL, url)
         startForegroundService(intent)
+        maybeRequestBatteryExemption()
+    }
+
+    /**
+     * 保活增强:请求"忽略电池优化"白名单。
+     * 原生安卓上 Doze 会冻结无 FCM 的长连接,国产 ROM 管得更严;
+     * 加入白名单后前台服务最稳。用户可拒绝(拒绝不影响功能,只是灭屏后可能掉线)。
+     */
+    private fun maybeRequestBatteryExemption() {
+        val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+        if (pm.isIgnoringBatteryOptimizations(packageName)) return
+        val asked = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean("asked_battery", false)
+        if (asked) return  // 只主动询问一次,之后可在系统设置里手动开
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean("asked_battery", true).apply()
+        AlertDialog.Builder(this)
+            .setTitle("保持后台连接")
+            .setMessage("为了让对讲机在灭屏后仍保持在线,建议把本应用加入电池优化白名单(忽略电池优化)。\n\n加入白名单会增加少量耗电;拒绝的话灭屏后可能需要重连。")
+            .setPositiveButton("去设置") { _, _ ->
+                try {
+                    startActivity(
+                        Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                            .setData(android.net.Uri.parse("package:$packageName"))
+                    )
+                } catch (e: Exception) {
+                    toast("请在系统设置中手动关闭本应用的电池优化")
+                }
+            }
+            .setNegativeButton("暂不", null)
+            .show()
     }
 
     // ---------------- PTT ----------------
@@ -421,6 +455,19 @@ class MainActivity : Activity() {
             }
         }
         dialog.show()
+    }
+
+    /** 退出确认:断开并停止前台服务,通知栏消失,进程自然退出 */
+    private fun showExitDialog() {
+        AlertDialog.Builder(this)
+            .setTitle("退出 esp32talking")
+            .setMessage("将断开连接并停止后台服务,期间无法收听群组语音。确定退出?")
+            .setPositiveButton("退出") { _, _ ->
+                svc?.exitApp()
+                finishAffinity()
+            }
+            .setNegativeButton("取消", null)
+            .show()
     }
 
     /** 修改自己的昵称 */

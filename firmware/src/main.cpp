@@ -12,12 +12,12 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_err.h>
-#include <esp_wifi.h>
 #include <driver/i2s.h>
 #include <WebSocketsClient.h>
 
 #include "config.h"
 #include "config_store.h"
+#include "adpcm.h"
 #include "provisioning.h"
 
 static WebSocketsClient ws;
@@ -85,81 +85,6 @@ static void ringClear() {
     }
 }
 
-// ---------- IMA ADPCM 编解码 (M3) ----------
-// 每帧自带 4 字节状态头(int16 预测样本 + uint8 步长索引 + uint8 保留),
-// 解码不依赖历史帧,丢一帧不影响后续音频
-#define ADPCM_FRAME_BYTES (4 + FRAME_SAMPLES / 2)  // 320 样本 -> 164 字节
-
-static const uint16_t stepTab[89] = {
-    7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
-    50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230,
-    253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724, 796, 876, 963,
-    1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024, 3327,
-    3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442,
-    11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794,
-    32767};
-static const int8_t indexTab[16] = {-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8};
-
-static int32_t adpcmPredictor = 0;  // 编码器跨帧状态
-static int32_t adpcmIndex = 0;
-
-#if USE_ADPCM
-// 编码 320 样本 -> 164 字节(偶数样本在高 4 位)
-static size_t adpcmEncode(const int16_t *pcm, uint8_t *out) {
-    int32_t pred = adpcmPredictor;
-    int32_t idx = adpcmIndex;
-    for (int i = 0; i < FRAME_SAMPLES; i++) {
-        int32_t diff = pcm[i] - pred;
-        int32_t sign = diff < 0 ? 8 : 0;
-        uint32_t mag = diff < 0 ? -(int32_t)diff : diff;
-        int32_t step = stepTab[idx];
-        uint8_t delta = 0;
-        if (mag >= (uint32_t)step) { delta |= 4; mag -= step; }
-        if (mag >= (uint32_t)(step >> 1)) { delta |= 2; mag -= step >> 1; }
-        if (mag >= (uint32_t)(step >> 2)) delta |= 1;
-        uint8_t nib = (uint8_t)(sign | delta);
-        int32_t diffq = step >> 3;
-        if (delta & 4) diffq += step;
-        if (delta & 2) diffq += step >> 1;
-        if (delta & 1) diffq += step >> 2;
-        pred += (sign ? -diffq : diffq);
-        if (pred > 32767) pred = 32767;
-        if (pred < -32768) pred = -32768;
-        idx += indexTab[nib];
-        if (idx < 0) idx = 0;
-        if (idx > 88) idx = 88;
-        if (i % 2 == 0) out[4 + i / 2] = (uint8_t)(nib << 4);
-        else out[4 + i / 2] |= nib;
-    }
-    adpcmPredictor = pred;
-    adpcmIndex = idx;
-    return ADPCM_FRAME_BYTES;
-}
-#endif
-
-// 解码 164 字节 -> 320 样本(状态取自帧头)
-static void adpcmDecode(const uint8_t *in, int16_t *pcm) {
-    int32_t pred = (int16_t)(in[0] | ((uint16_t)in[1] << 8));
-    int32_t idx = in[2];
-    if (idx > 88) idx = 88;
-    for (int i = 0; i < FRAME_SAMPLES; i++) {
-        uint8_t b = in[4 + i / 2];
-        uint8_t nib = (i % 2 == 0) ? (b >> 4) : (b & 0x0F);
-        int32_t step = stepTab[idx];
-        int32_t diffq = step >> 3;
-        if (nib & 4) diffq += step;
-        if (nib & 2) diffq += step >> 1;
-        if (nib & 1) diffq += step >> 2;
-        pred += (nib & 8) ? -diffq : diffq;
-        if (pred > 32767) pred = 32767;
-        if (pred < -32768) pred = -32768;
-        idx += indexTab[nib];
-        if (idx < 0) idx = 0;
-        if (idx > 88) idx = 88;
-        pcm[i] = (int16_t)pred;
-    }
-}
-
 // ---------- I2S 初始化 ----------
 static void micInit() {
     i2s_config_t cfg = {
@@ -217,13 +142,14 @@ static void spkInit() {
 }
 
 // ---------- 采集 / 播放 ----------
+#if USE_ADPCM
+static uint8_t adpcmFrame[adpcm::ENCODED_BYTES];
+static adpcm::Encoder enc;
+#endif
 static int32_t micRaw[FRAME_SAMPLES];
 static int16_t pcmFrame[FRAME_SAMPLES];
 static int16_t playPcm[FRAME_SAMPLES];
 static uint8_t playBuf[FRAME_BYTES];
-#if USE_ADPCM
-static uint8_t adpcmFrame[ADPCM_FRAME_BYTES];
-#endif
 
 static inline int16_t sat16(int32_t v) {
     if (v > 32767) return 32767;
@@ -246,9 +172,9 @@ static size_t micReadFrame() {
 static void speakerFeed() {
     size_t n = ringPop(playBuf, sizeof(playBuf));
     if (n == 0) return;
-    if (n == ADPCM_FRAME_BYTES) {
+    if (n == adpcm::ENCODED_BYTES) {
         // ADPCM 帧 -> 解码为 PCM
-        adpcmDecode(playBuf, playPcm);
+        adpcm::decode(playBuf, playPcm);
         memcpy(playBuf, playPcm, FRAME_BYTES);
     } else if (n != FRAME_BYTES) {
         return;  // 未知帧长,丢弃
@@ -393,6 +319,7 @@ void setup() {
 
     ws.begin(cfg.host.c_str(), cfg.port, SERVER_PATH);
     ws.onEvent(onWsEvent);
+    ws.enableHeartbeat(15000, 3000, 2);  // 心跳:空闲时 ping/pong 探测死连接
     Serial.printf("[服务器] %s:%u%s\n", cfg.host.c_str(), cfg.port, SERVER_PATH);
 }
 
@@ -462,7 +389,7 @@ void loop() {
         size_t n = micReadFrame();  // -> pcmFrame,n = FRAME_BYTES
         if (wsOk && n > 0) {
 #if USE_ADPCM
-            size_t m = adpcmEncode(pcmFrame, adpcmFrame);
+            size_t m = enc.encode(pcmFrame, adpcmFrame);
             ws.sendBIN(adpcmFrame, m);
 #else
             ws.sendBIN((uint8_t *)pcmFrame, n);
